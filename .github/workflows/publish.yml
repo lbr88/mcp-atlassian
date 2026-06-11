@@ -8,29 +8,32 @@ on:
 
 jobs:
   pypi-publish:
+    if: github.repository == 'sooperset/mcp-atlassian'
     name: Upload release to PyPI
     runs-on: ubuntu-latest
     environment:
       name: pypi
       url: https://pypi.org/p/mcp-atlassian # Link to your PyPI package
     permissions:
+      contents: read
       id-token: write # Necessary for PyPI's trusted publishing
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           fetch-depth: 0 # Required for uv-dynamic-versioning to get tags
+          persist-credentials: false
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
         with:
           python-version: "3.10" # Or your minimum supported Python
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v3
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
         with:
-          enable-cache: true
+          enable-cache: false
 
       - name: Build package
         run: uv build
