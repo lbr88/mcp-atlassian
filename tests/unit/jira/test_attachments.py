@@ -1,9 +1,10 @@
 """Tests for the Jira attachments module."""
 
 from pathlib import Path
-from unittest.mock import MagicMock, mock_open, patch
+from unittest.mock import MagicMock, Mock, mock_open, patch
 
 import pytest
+from requests.exceptions import HTTPError
 
 from mcp_atlassian.jira import JiraFetcher
 from mcp_atlassian.jira.attachments import AttachmentsMixin
@@ -58,6 +59,56 @@ class TestAttachmentsMixin:
         attachments_mixin.jira = MagicMock()
         attachments_mixin.jira._session = MagicMock()
         return attachments_mixin
+
+    @pytest.mark.parametrize(
+        ("jira_url", "api_version"),
+        [
+            ("https://test.atlassian.net", "3"),
+            ("https://jira.example.com", "2"),
+        ],
+    )
+    def test_delete_attachment_uses_deployment_api_version(
+        self,
+        attachments_mixin: AttachmentsMixin,
+        jira_url: str,
+        api_version: str,
+    ) -> None:
+        """Delete one attachment through the deployment's Jira REST API."""
+        attachments_mixin.config.url = jira_url
+        expected_url = f"rest/api/{api_version}/attachment/10001"
+        attachments_mixin.jira.resource_url.return_value = expected_url
+        attachments_mixin.jira.delete.return_value = None
+
+        result = attachments_mixin.delete_attachment("10001")
+
+        assert result is None
+        attachments_mixin.jira.resource_url.assert_called_once_with(
+            "attachment/10001", api_version=api_version
+        )
+        attachments_mixin.jira.delete.assert_called_once_with(expected_url)
+
+    def test_delete_attachment_requires_explicit_id(
+        self, attachments_mixin: AttachmentsMixin
+    ) -> None:
+        """Reject deletion when the caller did not provide an attachment ID."""
+        with pytest.raises(ValueError, match="attachment_id is required"):
+            attachments_mixin.delete_attachment("")
+
+        attachments_mixin.jira.delete.assert_not_called()
+
+    @pytest.mark.parametrize("status_code", [403, 404, 500])
+    def test_delete_attachment_propagates_jira_api_errors(
+        self, attachments_mixin: AttachmentsMixin, status_code: int
+    ) -> None:
+        """Surface permission, not-found, and other Jira API failures."""
+        expected_error = HTTPError(response=Mock(status_code=status_code))
+        attachments_mixin.jira.resource_url.return_value = "rest/api/3/attachment/10001"
+        attachments_mixin.jira.delete.side_effect = expected_error
+
+        with pytest.raises(HTTPError) as exc_info:
+            attachments_mixin.delete_attachment("10001")
+
+        assert exc_info.value is expected_error
 
     def test_download_attachment_success(self, attachments_mixin: AttachmentsMixin):
         """Test successful attachment download."""

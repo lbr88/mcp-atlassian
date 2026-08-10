@@ -77,6 +77,7 @@ CATEGORY_TOOLS: dict[str, list[str]] = {
         "jira_batch_create_versions",
     ],
     "jira-attachments": [
+        "jira_delete_attachment",
         "jira_download_attachments",
         "jira_get_issue_images",
     ],
@@ -152,7 +153,7 @@ CATEGORY_META: dict[str, dict[str, str]] = {
     },
     "jira-attachments": {
         "title": "Jira Attachments",
-        "description": "Download attachments and render issue images",
+        "description": "Delete and download attachments, and render issue images",
     },
     "jira-service-desk": {
         "title": "Jira Service Desk",

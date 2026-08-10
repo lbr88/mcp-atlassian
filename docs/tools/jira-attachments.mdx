@@ -1,6 +1,20 @@
 ---
 title: "Jira Attachments"
-description: "Download attachments and render issue images"
+description: "Delete and download attachments, and render issue images"
+---
+
+### Delete Attachment
+
+Permanently delete one explicitly identified Jira attachment.
+
+<Note>This is a **write** tool. Disabled when `READ_ONLY_MODE=true`.</Note>
+
+**Parameters:**
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `attachment_id` | `string` | Yes | The exact ID of one Jira attachment to permanently delete. Deletion cannot be undone. Resolve and verify the exact attachment ID before invoking this tool. |
+
 ---
 
 ### Download Attachments
@@ -21,7 +35,6 @@ Download attachments from a Jira issue.
 <Tip>
 Downloads all attachments from the issue. Files larger than 50MB are skipped. Returns base64-encoded content.
 </Tip>
-
 
 ---
 

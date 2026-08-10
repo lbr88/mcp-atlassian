@@ -19,6 +19,25 @@ logger = logging.getLogger("mcp-jira")
 class AttachmentsMixin(JiraClient, AttachmentsOperationsProto):
     """Mixin for Jira attachment operations."""
 
+    def delete_attachment(self, attachment_id: str) -> None:
+        """Permanently delete one Jira attachment.
+
+        Args:
+            attachment_id: The exact ID of the attachment to delete.
+
+        Raises:
+            ValueError: If attachment_id is empty.
+            requests.exceptions.HTTPError: If Jira rejects the request.
+        """
+        if not attachment_id:
+            raise ValueError("attachment_id is required")
+
+        api_version = "3" if self.config.is_cloud else "2"
+        url = self.jira.resource_url(
+            f"attachment/{attachment_id}", api_version=api_version
+        )
+        self.jira.delete(url)
+
     def download_attachment(self, url: str, target_path: str) -> bool:
         """
         Download a Jira attachment to the specified path.

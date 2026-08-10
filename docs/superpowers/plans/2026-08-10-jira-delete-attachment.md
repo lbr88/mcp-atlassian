@@ -22,7 +22,6 @@
 
 **Files:**
 - Modify: `src/mcp_atlassian/jira/attachments.py`
-- Modify: `src/mcp_atlassian/jira/protocols.py`
 - Test: `tests/unit/jira/test_attachments.py`
 
 **Interfaces:**
@@ -62,7 +61,9 @@ def delete_attachment(self, attachment_id: str) -> None:
     self.jira.delete(url)
 ```
 
-Declare the same signature and contract on `AttachmentsOperationsProto`.
+Keep `AttachmentsOperationsProto` unchanged because it is the narrow upload
+dependency consumed by `IssuesMixin`, not the complete attachment-client
+interface.
 
 - [ ] **Step 4: Run the client tests and verify GREEN**
 
@@ -153,9 +154,7 @@ Run:
 
 ```bash
 uv run pytest tests/unit/jira/test_attachments.py tests/unit/servers/test_jira_server.py tests/unit/utils/test_toolsets.py -q
-uv run ruff format --check src/mcp_atlassian/jira/attachments.py src/mcp_atlassian/jira/protocols.py src/mcp_atlassian/servers/jira.py tests/unit/jira/test_attachments.py tests/unit/servers/test_jira_server.py
-uv run ruff check src/mcp_atlassian/jira/attachments.py src/mcp_atlassian/jira/protocols.py src/mcp_atlassian/servers/jira.py tests/unit/jira/test_attachments.py tests/unit/servers/test_jira_server.py
-uv run mypy src/mcp_atlassian/jira/attachments.py src/mcp_atlassian/jira/protocols.py src/mcp_atlassian/servers/jira.py
+uv run pre-commit run --all-files
 ```
 
 Expected: all commands pass without errors.

@@ -10,6 +10,7 @@ import pytest
 from fastmcp import Client, FastMCP
 from fastmcp.client import FastMCPTransport
 from fastmcp.exceptions import ToolError
+from requests.exceptions import HTTPError
 from starlette.requests import Request
 
 from src.mcp_atlassian.jira import JiraFetcher
@@ -38,6 +39,7 @@ def mock_jira_fetcher():
     # Configure common methods
     mock_fetcher.get_current_user_account_id.return_value = "test-account-id"
     mock_fetcher.jira = MagicMock()
+    mock_fetcher.delete_attachment.return_value = None
 
     # Configure get_issue to return fixture data
     def mock_get_issue(
@@ -389,6 +391,7 @@ def test_jira_mcp(mock_jira_fetcher, mock_base_jira_config):
         create_issue,
         create_issue_link,
         create_sprint,
+        delete_attachment,
         delete_issue,
         download_attachments,
         edit_comment,
@@ -445,6 +448,7 @@ def test_jira_mcp(mock_jira_fetcher, mock_base_jira_config):
     jira_sub_mcp.add_tool(batch_create_issues)
     jira_sub_mcp.add_tool(batch_get_changelogs)
     jira_sub_mcp.add_tool(update_issue)
+    jira_sub_mcp.add_tool(delete_attachment)
     jira_sub_mcp.add_tool(delete_issue)
     jira_sub_mcp.add_tool(add_comment)
     jira_sub_mcp.add_tool(edit_comment)
@@ -550,6 +554,61 @@ async def test_get_issue(jira_client, mock_jira_fetcher):
         properties=None,
         update_history=True,
     )
+
+
+@pytest.mark.anyio
+async def test_delete_attachment(jira_client, mock_jira_fetcher):
+    """Delete exactly one Jira attachment and confirm its ID."""
+    response = await jira_client.call_tool(
+        "jira_delete_attachment", {"attachment_id": "10001"}
+    )
+
+    result = json.loads(response.content[0].text)
+    assert result == {
+        "message": "Attachment deleted successfully",
+        "attachment_id": "10001",
+    }
+    mock_jira_fetcher.delete_attachment.assert_called_once_with("10001")
+
+
+@pytest.mark.anyio
+async def test_delete_attachment_surfaces_jira_api_error(
+    jira_client, mock_jira_fetcher
+):
+    """Surface Jira permission, not-found, and API failures to MCP callers."""
+    mock_jira_fetcher.delete_attachment.side_effect = HTTPError("Jira API error")
+
+    with pytest.raises(ToolError, match="Jira API error"):
+        await jira_client.call_tool(
+            "jira_delete_attachment", {"attachment_id": "10001"}
+        )
+
+
+@pytest.mark.anyio
+async def test_delete_attachment_blocked_in_read_only_mode(
+    mock_base_jira_config, mock_jira_fetcher
+):
+    """Block attachment deletion before reaching Jira in read-only mode."""
+    from src.mcp_atlassian.servers.jira import (
+        delete_attachment as delete_attachment_tool,
+    )
+
+    ctx = MagicMock()
+    ctx.request_context.lifespan_context = {
+        "app_lifespan_context": MainAppContext(
+            full_jira_config=mock_base_jira_config,
+            read_only=True,
+        )
+    }
+
+    with patch(
+        "src.mcp_atlassian.servers.jira.get_jira_fetcher",
+        AsyncMock(return_value=mock_jira_fetcher),
+    ):
+        with pytest.raises(ToolError, match="read-only mode"):
+            await delete_attachment_tool.fn(ctx, "10001")
+
+    mock_jira_fetcher.delete_attachment.assert_not_called()
 
 
 @pytest.mark.anyio
