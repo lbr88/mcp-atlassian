@@ -4,7 +4,7 @@ import base64
 import json
 import logging
 import os
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, MutableMapping
 from contextlib import asynccontextmanager
 from typing import Any, Literal, Optional
 from urllib.parse import urlparse
@@ -360,7 +360,7 @@ class AtlassianMCP(FastMCP[MainAppContext]):
         return app
 
 
-token_validation_cache: TTLCache[
+token_validation_cache: MutableMapping[
     int, tuple[bool, str | None, JiraFetcher | None, ConfluenceFetcher | None]
 ] = TTLCache(maxsize=100, ttl=300)
 
