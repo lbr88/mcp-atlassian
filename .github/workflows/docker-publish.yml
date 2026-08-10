@@ -9,12 +9,19 @@ on:
       - main     # Trigger on PRs targeting main branch
   workflow_dispatch: {} # Allow manual triggering from the Actions tab
 
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
   build-and-push:
+    name: Build and publish image
     runs-on: ubuntu-latest
     permissions:
       contents: read  # Needed for checkout

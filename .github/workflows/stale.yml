@@ -6,14 +6,20 @@ on:
     - cron: '0 0 * * *'
   workflow_dispatch:
 
-permissions:
-  issues: write
-  pull-requests: write
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   stale:
+    name: Mark stale issues and pull requests
     if: github.repository == 'sooperset/mcp-atlassian'
     runs-on: ubuntu-latest
+    permissions:
+      issues: write # Required to label and comment on stale issues.
+      pull-requests: write # Required to label and comment on stale pull requests.
     steps:
       - uses: actions/stale@eb5cf3af3ac0a1aa4c9c45633dd1ae542a27a899 # v10.3.0
         with:
