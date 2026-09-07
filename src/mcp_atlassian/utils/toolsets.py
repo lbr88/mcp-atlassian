@@ -1,6 +1,6 @@
 """Toolset definitions and filtering utilities for MCP Atlassian.
 
-Groups 68 tools into 21 named toolsets controlled via the TOOLSETS env var.
+Groups 98 tools into 25 named toolsets controlled via the TOOLSETS env var.
 Supports 'all', 'default', and comma-separated toolset names.
 """
 
@@ -22,7 +22,7 @@ class ToolsetDefinition:
     default: bool
 
 
-# --- Jira toolsets (15) ---
+# --- Jira toolsets (16) ---
 
 JIRA_TOOLSETS: dict[str, ToolsetDefinition] = {
     "jira_issues": ToolsetDefinition(
@@ -82,7 +82,7 @@ JIRA_TOOLSETS: dict[str, ToolsetDefinition] = {
     ),
     "jira_service_desk": ToolsetDefinition(
         name="jira_service_desk",
-        description="Jira Service Management queues and service desks",
+        description="Jira Service Management requests, queues, and service desks",
         default=False,
     ),
     "jira_forms": ToolsetDefinition(
@@ -100,9 +100,14 @@ JIRA_TOOLSETS: dict[str, ToolsetDefinition] = {
         description="Development info (branches, PRs, commits)",
         default=False,
     ),
+    "jira_project_analysis": ToolsetDefinition(
+        name="jira_project_analysis",
+        description="Project epic hierarchy and cross-project dependencies",
+        default=False,
+    ),
 }
 
-# --- Confluence toolsets (6) ---
+# --- Confluence toolsets (8) ---
 
 CONFLUENCE_TOOLSETS: dict[str, ToolsetDefinition] = {
     "confluence_pages": ToolsetDefinition(
@@ -135,6 +140,16 @@ CONFLUENCE_TOOLSETS: dict[str, ToolsetDefinition] = {
         description="Attachment upload, download, and management",
         default=False,
     ),
+    "confluence_templates": ToolsetDefinition(
+        name="confluence_templates",
+        description="Cloud page template listing and page creation from templates",
+        default=False,
+    ),
+    "confluence_permissions": ToolsetDefinition(
+        name="confluence_permissions",
+        description="Content and space permission checking",
+        default=False,
+    ),
 }
 
 # --- Combined registry ---
@@ -142,6 +157,11 @@ CONFLUENCE_TOOLSETS: dict[str, ToolsetDefinition] = {
 ALL_TOOLSETS: dict[str, ToolsetDefinition] = {
     **JIRA_TOOLSETS,
     **CONFLUENCE_TOOLSETS,
+    "legacy": ToolsetDefinition(
+        name="legacy",
+        description="Deprecated tools retained for migration compatibility",
+        default=False,
+    ),
 }
 
 DEFAULT_TOOLSETS: set[str] = {
@@ -152,7 +172,7 @@ DEFAULT_TOOLSETS: set[str] = {
 def get_enabled_toolsets() -> set[str]:
     """Parse the TOOLSETS env var into a set of enabled toolset names.
 
-    Supports keywords 'all' (all 21 toolsets) and 'default' (6 defaults),
+    Supports keywords 'all' (all 25 toolsets) and 'default' (6 defaults),
     plus comma-separated specific toolset names. Case-insensitive for keywords.
 
     When TOOLSETS is unset or empty, returns all toolsets with a deprecation
@@ -165,9 +185,9 @@ def get_enabled_toolsets() -> set[str]:
         names are given, returns an empty set (fail-closed).
 
     Examples:
-        TOOLSETS unset -> all 21 toolsets (with deprecation warning)
-        TOOLSETS="" -> all 21 toolsets (with deprecation warning)
-        TOOLSETS="all" -> all 21 names
+        TOOLSETS unset -> all 25 toolsets (with deprecation warning)
+        TOOLSETS="" -> all 25 toolsets (with deprecation warning)
+        TOOLSETS="all" -> all 25 names
         TOOLSETS="default" -> 6 default names
         TOOLSETS="default,jira_agile" -> defaults + jira_agile
         TOOLSETS="typo_name" -> set() (fail-closed)

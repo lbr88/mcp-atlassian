@@ -4,7 +4,56 @@ import ipaddress
 import os
 import re
 import socket
-from urllib.parse import urlparse
+from collections.abc import Callable
+from typing import Any
+from urllib.parse import urljoin, urlparse
+
+
+def _url_origin(url: str) -> tuple[str, str, int] | None:
+    """Return an unambiguous HTTP origin for configured redirect comparisons."""
+    try:
+        parsed = urlparse(url)
+        if (
+            parsed.scheme not in ("http", "https")
+            or not parsed.hostname
+            or "\\" in parsed.netloc
+            or parsed.username is not None
+            or parsed.password is not None
+        ):
+            return None
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        return parsed.scheme, parsed.hostname.lower(), port
+    except ValueError:
+        return None
+
+
+def make_ssrf_redirect_hook() -> Callable[..., Any]:
+    """Return a requests ``response`` hook that blocks SSRF-unsafe redirects.
+
+    Attach to any session (``session.hooks["response"].append(...)``) so that an
+    open redirect cannot steer an outbound request to an internal/metadata host.
+    """
+
+    def hook(response: Any, **kwargs: Any) -> Any:
+        if response.is_redirect:
+            redirect_url = urljoin(response.url, response.headers.get("Location", ""))
+            origin = _url_origin(response.url)
+            if (
+                origin is not None
+                and _url_origin(redirect_url) == origin
+                and any(
+                    _url_origin(os.getenv(name, "")) == origin
+                    for name in ("JIRA_URL", "CONFLUENCE_URL")
+                )
+            ):
+                return response
+            error = validate_url_for_ssrf(redirect_url)
+            if error:
+                response.close()
+                raise ValueError(f"Redirect blocked (SSRF): {error}")
+        return response
+
+    return hook
 
 
 def resolve_relative_url(url: str, base_url: str) -> str:
@@ -88,6 +137,12 @@ def validate_url_for_ssrf(url: str) -> str | None:
     # Scheme check
     if parsed.scheme not in ("http", "https"):
         return f"Blocked scheme: {parsed.scheme} (only http/https allowed)"
+
+    # requests (and browsers, per WHATWG) treat a backslash in the authority as a
+    # path separator, so "http://localhost\@evil.com/" parses (urlparse) to host
+    # evil.com but actually connects to localhost. Reject the parse mismatch.
+    if "\\" in parsed.netloc:
+        return f"Blocked backslash in URL authority: {url}"
 
     hostname = parsed.hostname
     if not hostname:
