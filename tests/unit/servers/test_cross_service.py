@@ -8,11 +8,8 @@ from requests.sessions import Session
 
 from mcp_atlassian.confluence import ConfluenceConfig
 from mcp_atlassian.jira import JiraConfig
-from mcp_atlassian.servers.context import MainAppContext
 from mcp_atlassian.servers.dependencies import (
     _create_user_config_for_fetcher,
-    get_confluence_fetcher,
-    get_jira_fetcher,
 )
 from mcp_atlassian.servers.main import AtlassianMCP, main_lifespan
 from mcp_atlassian.utils.environment import get_available_services
@@ -21,7 +18,7 @@ from tests.utils.factories import (
     ConfluencePageFactory,
     JiraIssueFactory,
 )
-from tests.utils.mocks import MockAtlassianClient, MockEnvironment, MockFastMCP
+from tests.utils.mocks import MockAtlassianClient, MockEnvironment
 
 
 class TestCrossServiceUserResolution:
@@ -145,60 +142,6 @@ class TestSharedAuthentication:
             assert jira_config.api_token == confluence_config.api_token
             assert jira_config.auth_type == confluence_config.auth_type
 
-    @pytest.mark.anyio
-    async def test_authentication_context_in_request(self):
-        """Test authentication context is properly maintained in request state."""
-        with MockEnvironment.basic_auth_env():
-            request = MockFastMCP.create_request()
-            request.state.user_atlassian_auth_type = "oauth"
-            request.state.user_atlassian_token = "test-oauth-token"
-            request.state.user_atlassian_email = "test@example.com"
-
-            with patch(
-                "mcp_atlassian.servers.dependencies.get_http_request",
-                return_value=request,
-            ):
-                # Create mock context with lifespan data
-                ctx = MockFastMCP.create_context()
-                ctx.request_context = MagicMock()
-                ctx.request_context.lifespan_context = {
-                    "app_lifespan_context": MainAppContext(
-                        full_jira_config=JiraConfig.from_env(),
-                        full_confluence_config=ConfluenceConfig.from_env(),
-                        read_only=False,
-                        enabled_tools=None,
-                    )
-                }
-
-                # Mock the fetcher creation
-                with (
-                    patch("mcp_atlassian.jira.JiraFetcher") as mock_jira_fetcher,
-                    patch(
-                        "mcp_atlassian.confluence.ConfluenceFetcher"
-                    ) as mock_confluence_fetcher,
-                ):
-                    # Mock the current user validation
-                    mock_jira_instance = MagicMock()
-                    mock_jira_instance.get_current_user_account_id.return_value = (
-                        "user123"
-                    )
-                    mock_jira_fetcher.return_value = mock_jira_instance
-
-                    mock_confluence_instance = MagicMock()
-                    mock_confluence_instance.get_current_user_info.return_value = {
-                        "email": "test@example.com",
-                        "displayName": "Test User",
-                    }
-                    mock_confluence_fetcher.return_value = mock_confluence_instance
-
-                    # Get fetchers - should use the same auth context
-                    jira_fetcher = await get_jira_fetcher(ctx)
-                    confluence_fetcher = await get_confluence_fetcher(ctx)
-
-                    # Verify both fetchers were created
-                    assert request.state.jira_fetcher is not None
-                    assert request.state.confluence_fetcher is not None
-
 
 class TestCrossServiceErrorHandling:
     """Test error handling and propagation across services."""
@@ -314,6 +257,8 @@ class TestSharedSSLProxyConfiguration:
             "HTTP_PROXY": "http://proxy.example.com:8080",
             "HTTPS_PROXY": "https://proxy.example.com:8443",
             "NO_PROXY": "localhost,127.0.0.1",
+            "ATLASSIAN_PROXY_WPAD_ENABLE": "true",
+            "ATLASSIAN_PROXY_WPAD_URL": "http://wpad.example.com/wpad.dat",
         }
 
         with MockEnvironment.basic_auth_env():
@@ -321,14 +266,46 @@ class TestSharedSSLProxyConfiguration:
                 jira_config = JiraConfig.from_env()
                 confluence_config = ConfluenceConfig.from_env()
 
-                # Both services should have the same proxy configuration
                 assert jira_config.http_proxy == proxy_config["HTTP_PROXY"]
                 assert jira_config.https_proxy == proxy_config["HTTPS_PROXY"]
                 assert jira_config.no_proxy == proxy_config["NO_PROXY"]
+                assert jira_config.proxy_wpad_enable is True
+                assert jira_config.proxy_wpad_url == "http://wpad.example.com/wpad.dat"
 
                 assert confluence_config.http_proxy == proxy_config["HTTP_PROXY"]
                 assert confluence_config.https_proxy == proxy_config["HTTPS_PROXY"]
                 assert confluence_config.no_proxy == proxy_config["NO_PROXY"]
+                assert confluence_config.proxy_wpad_enable is True
+                assert (
+                    confluence_config.proxy_wpad_url
+                    == "http://wpad.example.com/wpad.dat"
+                )
+
+    def test_service_specific_wpad_overrides_remain_independent(self):
+        """Test Jira and Confluence can override global WPAD settings independently."""
+        with MockEnvironment.basic_auth_env():
+            with patch.dict(
+                os.environ,
+                {
+                    "ATLASSIAN_PROXY_WPAD_ENABLE": "true",
+                    "ATLASSIAN_PROXY_WPAD_URL": "http://global-wpad.example.com/wpad.dat",
+                    "JIRA_PROXY_WPAD_ENABLE": "false",
+                    "CONFLUENCE_PROXY_WPAD_URL": "http://conf-wpad.example.com/wpad.dat",
+                },
+            ):
+                jira_config = JiraConfig.from_env()
+                confluence_config = ConfluenceConfig.from_env()
+
+                assert jira_config.proxy_wpad_enable is False
+                assert (
+                    jira_config.proxy_wpad_url
+                    == "http://global-wpad.example.com/wpad.dat"
+                )
+                assert confluence_config.proxy_wpad_enable is True
+                assert (
+                    confluence_config.proxy_wpad_url
+                    == "http://conf-wpad.example.com/wpad.dat"
+                )
 
 
 class TestConcurrentServiceInitialization:
@@ -374,90 +351,6 @@ class TestConcurrentServiceInitialization:
                     # Verify concurrent initialization (interleaved order)
                     assert "jira_start" in init_order
                     assert "confluence_start" in init_order
-
-    @pytest.mark.anyio
-    async def test_parallel_fetcher_creation(self):
-        """Test that fetchers can be created in parallel for both services."""
-        with MockEnvironment.oauth_env():
-            with patch.dict(
-                os.environ,
-                {"ATLASSIAN_OAUTH_ENABLE": "true"},
-            ):
-                # Create mock request with user context
-                request = MockFastMCP.create_request()
-                request.state.user_atlassian_auth_type = "oauth"
-                request.state.user_atlassian_token = "test-token"
-                request.state.user_atlassian_email = "test@example.com"
-
-                # Create context
-                ctx = MockFastMCP.create_context()
-                ctx.request_context = MagicMock()
-                ctx.request_context.lifespan_context = {
-                    "app_lifespan_context": MainAppContext(
-                        full_jira_config=JiraConfig.from_env(),
-                        full_confluence_config=ConfluenceConfig.from_env(),
-                        read_only=False,
-                        enabled_tools=None,
-                    )
-                }
-
-                with (
-                    patch(
-                        "mcp_atlassian.servers.dependencies.get_http_request",
-                        return_value=request,
-                    ),
-                    patch("mcp_atlassian.jira.JiraFetcher") as mock_jira_fetcher,
-                    patch(
-                        "mcp_atlassian.confluence.ConfluenceFetcher"
-                    ) as mock_confluence_fetcher,
-                ):
-                    # Mock fetcher instances
-                    mock_jira_instance = MagicMock()
-                    mock_jira_instance.get_current_user_account_id.return_value = (
-                        "user123"
-                    )
-                    mock_jira_fetcher.return_value = mock_jira_instance
-
-                    mock_confluence_instance = MagicMock()
-                    mock_confluence_instance.get_current_user_info.return_value = {
-                        "email": "test@example.com",
-                        "displayName": "Test User",
-                    }
-                    mock_confluence_fetcher.return_value = mock_confluence_instance
-
-                    # Create fetchers in parallel
-                    import anyio
-
-                    async def fetch_jira():
-                        return await get_jira_fetcher(ctx)
-
-                    async def fetch_confluence():
-                        return await get_confluence_fetcher(ctx)
-
-                    # Wait for both using anyio task group
-                    async with anyio.create_task_group() as tg:
-                        jira_future = None
-                        confluence_future = None
-
-                        async def set_jira():
-                            nonlocal jira_future
-                            jira_future = await fetch_jira()
-
-                        async def set_confluence():
-                            nonlocal confluence_future
-                            confluence_future = await fetch_confluence()
-
-                        tg.start_soon(set_jira)
-                        tg.start_soon(set_confluence)
-
-                    jira_fetcher = jira_future
-                    confluence_fetcher = confluence_future
-
-                    # Both should be created successfully
-                    assert jira_fetcher is not None
-                    assert confluence_fetcher is not None
-                    assert request.state.jira_fetcher is jira_fetcher
-                    assert request.state.confluence_fetcher is confluence_fetcher
 
 
 class TestServiceAvailabilityDetection:

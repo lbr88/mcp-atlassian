@@ -6,10 +6,14 @@ Provides get_jira_fetcher and get_confluence_fetcher for use in tool functions.
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import logging
+import os
+import threading
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
+from cachetools import TTLCache
 from fastmcp import Context
 from fastmcp.server.dependencies import get_access_token, get_http_request
 from starlette.requests import Request
@@ -17,7 +21,13 @@ from starlette.requests import Request
 from mcp_atlassian.confluence import ConfluenceConfig, ConfluenceFetcher
 from mcp_atlassian.jira import JiraConfig, JiraFetcher
 from mcp_atlassian.servers.context import MainAppContext
+from mcp_atlassian.utils.env import (
+    get_header_names,
+    is_env_ssl_verify,
+    is_env_truthy,
+)
 from mcp_atlassian.utils.oauth import OAuthConfig
+from mcp_atlassian.utils.proxy import get_proxy_settings_from_env
 from mcp_atlassian.utils.urls import validate_url_for_ssrf
 
 if TYPE_CHECKING:
@@ -45,12 +55,188 @@ class _ServiceSpec:
     config_attr: str  # MainAppContext attribute for global config
     url_header: str  # X-Atlassian-{Service}-Url
     token_header: str  # X-Atlassian-{Service}-Personal-Token
+    passthrough_env_var: str  # {SERVICE}_PASSTHROUGH_HEADERS
     filter_kwargs: dict[str, Any]  # e.g. {"projects_filter": None}
     get_session: Callable[[Any], Any]  # fetcher → session
     validate_fn: Callable[[Any], Any]  # fetcher → validation data
     on_validated: Callable[
         [str, Request, Any, str, str | None], None
     ]  # logging + email backfill
+
+
+# ---------------------------------------------------------------------------
+# Cross-request credential validation cache (#1405)
+#
+# In multi-user HTTP transport, every request builds a fresh fetcher on
+# request.state, so credential validation (a network call to Atlassian) was
+# firing once per request instead of once per credential. This cache dedupes
+# that call across requests for the configured TTL. Only a SHA-256 digest of
+# the credential AND effective validation target is ever used as a key -- raw
+# tokens are never stored. Header-based PAT auth uses a per-request base URL,
+# while Cloud OAuth uses the tenant-specific Cloud ID rather than its fixed
+# configured URL.
+# ---------------------------------------------------------------------------
+
+
+def _validation_cache_ttl() -> int:
+    """TTL in seconds for cached validation results. 0 disables the cache."""
+    try:
+        return int(os.getenv("MCP_ATLASSIAN_VALIDATION_CACHE_TTL", "300"))
+    except ValueError:
+        return 300
+
+
+def _validation_cache_maxsize() -> int:
+    try:
+        return int(os.getenv("MCP_ATLASSIAN_VALIDATION_CACHE_MAXSIZE", "100"))
+    except ValueError:
+        return 100
+
+
+_CACHE_TTL = _validation_cache_ttl()
+_CACHE_MAXSIZE = _validation_cache_maxsize()
+_validation_cache: TTLCache[tuple[str, str], Any] | None = (
+    TTLCache(maxsize=_CACHE_MAXSIZE, ttl=_CACHE_TTL)
+    if _CACHE_TTL > 0 and _CACHE_MAXSIZE > 0
+    else None
+)
+_CACHE_MISS = object()  # sentinel distinguishing "not cached" from a cached None
+_validation_cache_lock = threading.RLock()
+
+
+@dataclasses.dataclass
+class _ValidationInFlight:
+    """Coordinate concurrent validation calls for one cache key."""
+
+    event: threading.Event = dataclasses.field(default_factory=threading.Event)
+    validation_data: Any = _CACHE_MISS
+    error: BaseException | None = None
+
+
+_validation_inflight: dict[tuple[str, str], _ValidationInFlight] = {}
+
+
+def _credential_for_cache(config: JiraConfig | ConfluenceConfig) -> str | None:
+    """Extract the secret that authenticates ``config``, for cache-key hashing.
+
+    Returns None when no credential-bearing field is set, so the caller can
+    skip caching rather than key on an empty/ambiguous value.
+    """
+    if config.auth_type == "oauth":
+        oauth_cfg = getattr(config, "oauth_config", None)
+        return getattr(oauth_cfg, "access_token", None) if oauth_cfg else None
+    if config.auth_type == "pat":
+        return config.personal_token
+    if config.auth_type == "basic":
+        if not config.api_token:
+            return None
+        # Username + token together identify the credential; a token reused
+        # under a different username should still validate independently.
+        return f"{getattr(config, 'username', '') or ''}:{config.api_token}"
+    return None
+
+
+def _validation_cache_key(
+    spec: _ServiceSpec, credential: str, scope: str
+) -> tuple[str, str]:
+    """Build the cache key, scoped to both the credential and target.
+
+    Header-based PAT auth accepts the base URL per-request (from
+    X-Atlassian-*-Url), so the same credential string reused against a
+    different instance must not share a cached validation result.
+    """
+    digest = hashlib.sha256(f"{scope}\x00{credential}".encode()).hexdigest()
+    return (spec.name, digest)
+
+
+def _validation_cache_scope(config: JiraConfig | ConfluenceConfig) -> str:
+    """Return the target identity to include in a validation cache key.
+
+    Cloud OAuth requests share the same API hostname, so the configured URL
+    does not identify the tenant. Use the effective Cloud ID for Cloud OAuth,
+    the OAuth base URL for Data Center OAuth, and the configured URL for other
+    authentication modes.
+    """
+    oauth_config = getattr(config, "oauth_config", None)
+    cloud_id = getattr(oauth_config, "cloud_id", None)
+    oauth_base_url = getattr(oauth_config, "base_url", None)
+    if config.auth_type == "oauth" and isinstance(cloud_id, str) and cloud_id:
+        return f"cloud-oauth\x00{cloud_id}"
+    if config.auth_type == "oauth" and isinstance(oauth_base_url, str):
+        return f"dc-oauth\x00{oauth_base_url}"
+    url = getattr(config, "url", "")
+    return f"url\x00{url if isinstance(url, str) else ''}"
+
+
+def _passthrough_cache_scope(passthrough_headers: dict[str, str]) -> str:
+    """Hash the effective passthrough headers for validation cache scoping.
+
+    Passthrough headers can identify the user even when the Atlassian token is
+    shared. Keep their values out of the cache itself and out of logs by using
+    only a stable digest of the normalized header names and values.
+    """
+    normalized_headers = sorted(
+        (header_name.lower(), header_value)
+        for header_name, header_value in passthrough_headers.items()
+    )
+    header_material = "\x00".join(
+        f"{header_name}\x00{header_value}"
+        for header_name, header_value in normalized_headers
+    )
+    return hashlib.sha256(header_material.encode()).hexdigest()
+
+
+def _validate_with_cache(
+    cache_key: tuple[str, str],
+    validation_cache: TTLCache[tuple[str, str], Any],
+    validate_fn: Callable[[], Any],
+    fn_name: str,
+    service_name: str,
+) -> Any:
+    """Return cached validation data or run one validation per cache key.
+
+    The process-wide lock protects only cache and in-flight bookkeeping. The
+    network validation runs outside it, allowing unrelated credentials to
+    validate concurrently while callers for the same key share one result.
+    """
+    with _validation_cache_lock:
+        cached_validation = validation_cache.get(cache_key, _CACHE_MISS)
+        if cached_validation is not _CACHE_MISS:
+            logger.debug(
+                f"{fn_name}: Reusing cached {service_name} credential "
+                "validation (skipped network call)."
+            )
+            return cached_validation
+
+        in_flight = _validation_inflight.get(cache_key)
+        if in_flight is None:
+            in_flight = _ValidationInFlight()
+            _validation_inflight[cache_key] = in_flight
+            owns_validation = True
+        else:
+            owns_validation = False
+
+    if not owns_validation:
+        in_flight.event.wait()
+        if in_flight.error is not None:
+            raise in_flight.error
+        return in_flight.validation_data
+
+    try:
+        validation_data = validate_fn()
+    except BaseException as error:
+        with _validation_cache_lock:
+            in_flight.error = error
+            _validation_inflight.pop(cache_key, None)
+            in_flight.event.set()
+        raise
+
+    with _validation_cache_lock:
+        validation_cache[cache_key] = validation_data
+        in_flight.validation_data = validation_data
+        _validation_inflight.pop(cache_key, None)
+        in_flight.event.set()
+    return validation_data
 
 
 def _jira_on_validated(
@@ -136,6 +322,7 @@ def _jira_spec() -> _ServiceSpec:
         config_attr="full_jira_config",
         url_header="X-Atlassian-Jira-Url",
         token_header="X-Atlassian-Jira-Personal-Token",  # noqa: S106
+        passthrough_env_var="JIRA_PASSTHROUGH_HEADERS",
         filter_kwargs={"projects_filter": None},
         get_session=lambda f: f.jira._session,
         validate_fn=lambda f: f.get_current_user_account_id(),
@@ -157,6 +344,7 @@ def _confluence_spec() -> _ServiceSpec:
         config_attr="full_confluence_config",
         url_header="X-Atlassian-Confluence-Url",
         token_header="X-Atlassian-Confluence-Personal-Token",  # noqa: S106
+        passthrough_env_var="CONFLUENCE_PASSTHROUGH_HEADERS",
         filter_kwargs={"spaces_filter": None},
         get_session=lambda f: f.confluence._session,
         validate_fn=lambda f: f.get_current_user_info(),
@@ -197,6 +385,97 @@ def _get_global_config(
     return config
 
 
+def _get_passthrough_header_names(config: Any, spec: _ServiceSpec) -> list[str]:
+    configured_names = getattr(config, "passthrough_headers", None)
+    if configured_names is not None:
+        return configured_names
+    return get_header_names(spec.passthrough_env_var)
+
+
+def _get_request_passthrough_headers(
+    request: Request, spec: _ServiceSpec, config: Any
+) -> dict[str, str]:
+    request_headers = getattr(request, "headers", None)
+    if request_headers is None:
+        return {}
+
+    passthrough_headers: dict[str, str] = {}
+    for header_name in _get_passthrough_header_names(config, spec):
+        header_value = request_headers.get(header_name)
+        if header_value is not None:
+            passthrough_headers[header_name] = header_value
+
+    if passthrough_headers:
+        logger.debug(
+            "Forwarding %d passthrough headers to %s: %s",
+            len(passthrough_headers),
+            spec.name,
+            list(passthrough_headers.keys()),
+        )
+    return passthrough_headers
+
+
+def _merge_passthrough_headers(
+    custom_headers: dict[str, str] | None, passthrough_headers: dict[str, str]
+) -> dict[str, str]:
+    merged_headers = dict(custom_headers or {})
+    passthrough_names = {name.lower() for name in passthrough_headers}
+    for header_name in list(merged_headers):
+        if header_name.lower() in passthrough_names:
+            del merged_headers[header_name]
+    merged_headers.update(passthrough_headers)
+    return merged_headers
+
+
+def _with_request_passthrough_headers(
+    request: Request,
+    spec: _ServiceSpec,
+    config: Any,
+    passthrough_headers: dict[str, str] | None = None,
+) -> Any:
+    if passthrough_headers is None:
+        passthrough_headers = _get_request_passthrough_headers(request, spec, config)
+    if not passthrough_headers:
+        return config
+
+    custom_headers = _merge_passthrough_headers(
+        getattr(config, "custom_headers", None), passthrough_headers
+    )
+    return dataclasses.replace(config, custom_headers=custom_headers)
+
+
+def _get_header_pat_network_config(ctx: Context, spec: _ServiceSpec) -> dict[str, Any]:
+    """Resolve operator-controlled network settings for header PAT requests.
+
+    Args:
+        ctx: FastMCP request context.
+        spec: Service specification for Jira or Confluence.
+
+    Returns:
+        SSL and proxy settings from the global config when available, otherwise
+        from service-specific or shared environment variables.
+    """
+    try:
+        global_config = _get_global_config(ctx, spec)
+    except ValueError:
+        env_prefix = spec.name.upper()
+        proxy_settings = get_proxy_settings_from_env(env_prefix)
+        return {
+            "ssl_verify": is_env_ssl_verify(f"{env_prefix}_SSL_VERIFY"),
+            **proxy_settings,
+        }
+
+    return {
+        "ssl_verify": global_config.ssl_verify,
+        "http_proxy": global_config.http_proxy,
+        "https_proxy": global_config.https_proxy,
+        "no_proxy": global_config.no_proxy,
+        "socks_proxy": global_config.socks_proxy,
+        "proxy_wpad_enable": global_config.proxy_wpad_enable,
+        "proxy_wpad_url": global_config.proxy_wpad_url,
+    }
+
+
 def _create_and_validate(
     request: Request,
     spec: _ServiceSpec,
@@ -207,6 +486,10 @@ def _create_and_validate(
     attach_ssrf_hook: bool = False,
 ) -> Any:
     """Create a fetcher, validate credentials, cache on request.state.
+
+    The validation network call itself is deduped across requests for the
+    same credential via ``_validation_cache`` (#1405) -- only fetcher
+    construction and ``request.state`` caching happen per-request.
 
     Args:
         request: The current Starlette request.
@@ -225,13 +508,44 @@ def _create_and_validate(
     fn_name = f"get_{spec.name.lower()}_fetcher"
     auth_desc = "header-based" if auth_branch == "header_pat" else "user"
     try:
+        request_passthrough_headers = _get_request_passthrough_headers(
+            request, spec, config
+        )
+        config = _with_request_passthrough_headers(
+            request,
+            spec,
+            config,
+            request_passthrough_headers,
+        )
+        credential = _credential_for_cache(config)
+        cache_scope = _validation_cache_scope(config)
+        if request_passthrough_headers:
+            cache_scope = (
+                f"{cache_scope}\x00passthrough\x00"
+                f"{_passthrough_cache_scope(request_passthrough_headers)}"
+            )
+        cache_key = (
+            _validation_cache_key(spec, credential, cache_scope)
+            if credential and _validation_cache is not None
+            else None
+        )
         fetcher = spec.fetcher_class(config=config)
         if attach_ssrf_hook:
             session = spec.get_session(fetcher)
             session.hooks["response"].append(
                 _make_ssrf_safe_hook(validate_url_for_ssrf)
             )
-        validation_data = spec.validate_fn(fetcher)
+        validation_cache = _validation_cache
+        if cache_key is not None and validation_cache is not None:
+            validation_data = _validate_with_cache(
+                cache_key,
+                validation_cache,
+                lambda: spec.validate_fn(fetcher),
+                fn_name,
+                spec.name,
+            )
+        else:
+            validation_data = spec.validate_fn(fetcher)
         spec.on_validated(
             fn_name,
             request,
@@ -387,6 +701,8 @@ def _create_user_config_for_fetcher(
         "https_proxy": base_config.https_proxy,
         "no_proxy": base_config.no_proxy,
         "socks_proxy": base_config.socks_proxy,
+        "proxy_wpad_enable": base_config.proxy_wpad_enable,
+        "proxy_wpad_url": base_config.proxy_wpad_url,
     }
 
     if auth_type == "oauth":
@@ -422,16 +738,18 @@ def _create_user_config_for_fetcher(
                 "or set base_url for Data Center OAuth."
             )
 
-        # For minimal OAuth config (user-provided tokens), use empty strings for client credentials
+        # Minimal OAuth config (user-provided tokens): client credentials fall back
+        # to empty strings. The global oauth_config may be a
+        # BYOAccessTokenOAuthConfig (e.g. a placeholder *_OAUTH_ACCESS_TOKEN set to
+        # suppress the headless OAuth setup flow), which has no
+        # client_id/client_secret/redirect_uri/scope attributes. With the OAuth proxy
+        # active these come from the proxy config, not here, so getattr() with an
+        # empty-string fallback is safe and avoids an AttributeError.
         oauth_config_for_user = OAuthConfig(
-            client_id=global_oauth_cfg.client_id if global_oauth_cfg.client_id else "",
-            client_secret=global_oauth_cfg.client_secret
-            if global_oauth_cfg.client_secret
-            else "",
-            redirect_uri=global_oauth_cfg.redirect_uri
-            if global_oauth_cfg.redirect_uri
-            else "",
-            scope=global_oauth_cfg.scope if global_oauth_cfg.scope else "",
+            client_id=getattr(global_oauth_cfg, "client_id", "") or "",
+            client_secret=getattr(global_oauth_cfg, "client_secret", "") or "",
+            redirect_uri=getattr(global_oauth_cfg, "redirect_uri", "") or "",
+            scope=getattr(global_oauth_cfg, "scope", "") or "",
             access_token=user_access_token,
             refresh_token=None,
             expires_at=None,
@@ -506,8 +824,11 @@ async def _get_fetcher(ctx: Context, spec: _ServiceSpec) -> Any:
     """
     fn_name = f"get_{spec.name.lower()}_fetcher"
     logger.debug(f"{fn_name}: ENTERED. Context ID: {id(ctx)}")
+    request: Request | None = None
+    in_http_context = False
     try:
-        request: Request = get_http_request()
+        request = get_http_request()
+        in_http_context = True
         logger.debug(
             f"{fn_name}: In HTTP request context. "
             f"Request URL: {request.url}. "
@@ -545,12 +866,11 @@ async def _get_fetcher(ctx: Context, spec: _ServiceSpec) -> Any:
                 url=url_header_val,
                 auth_type="pat",
                 personal_token=token_header_val,
-                ssl_verify=True,
-                http_proxy=None,
-                https_proxy=None,
-                no_proxy=None,
-                socks_proxy=None,
+                **_get_header_pat_network_config(ctx, spec),
+                # Never forward instance-specific custom headers to a URL
+                # selected per request.
                 custom_headers=None,
+                passthrough_headers=get_header_names(spec.passthrough_env_var),
                 **spec.filter_kwargs,
             )
             return _create_and_validate(
@@ -590,6 +910,7 @@ async def _get_fetcher(ctx: Context, spec: _ServiceSpec) -> Any:
                 user_config,
                 "basic",
                 user_email=user_email,
+                attach_ssrf_hook=True,
             )
 
         # --- Branch 3: OAuth / PAT with token ---
@@ -639,6 +960,7 @@ async def _get_fetcher(ctx: Context, spec: _ServiceSpec) -> Any:
                 user_config,
                 "oauth_pat",
                 user_email=user_email,
+                attach_ssrf_hook=True,
             )
 
         else:
@@ -661,12 +983,64 @@ async def _get_fetcher(ctx: Context, spec: _ServiceSpec) -> Any:
         getattr(app_ctx, spec.config_attr, None) if app_ctx else None
     )
     if global_config_fallback:
+        # An HTTP request that reaches here has no per-user identity: serving it
+        # with the operator's global credentials lets any unauthenticated caller
+        # transact as the operator. Refuse unless explicitly opted in. Non-HTTP
+        # (stdio, single-user) is unaffected — the operator is the user there.
+        if (
+            in_http_context
+            and global_config_fallback.auth_type != "external"
+            and not is_env_truthy("ALLOW_GLOBAL_CRED_FALLBACK")
+        ):
+            raise ValueError(
+                f"{spec.name} client (fetcher) not available: refusing to serve an "
+                "unauthenticated request with the operator's global credentials. "
+                "Provide a user token, or set ALLOW_GLOBAL_CRED_FALLBACK=true to "
+                "allow the global-credential fallback (single-user deployments only)."
+            )
         logger.debug(
             f"{fn_name}: Using global {spec.name}Fetcher "
             "from lifespan_context. "
             f"Global config auth_type: "
             f"{global_config_fallback.auth_type}"
         )
+        if request is not None:
+            # Per-request URL override for external auth mode when no URL is
+            # configured server-side (URL is supplied via request header instead).
+            if (
+                global_config_fallback.auth_type == "external"
+                and not global_config_fallback.url
+            ):
+                url_from_header = request.headers.get(spec.url_header)
+                if url_from_header:
+                    if not os.getenv("MCP_ALLOWED_URL_DOMAINS", "").strip():
+                        error_msg = (
+                            f"Dynamic {spec.name} URLs in external auth mode require "
+                            "MCP_ALLOWED_URL_DOMAINS to prevent passthrough credential "
+                            "exfiltration."
+                        )
+                        raise ValueError(error_msg)
+                    ssrf_error = validate_url_for_ssrf(url_from_header)
+                    if ssrf_error:
+                        error_msg = f"Forbidden: Invalid {spec.name} URL - {ssrf_error}"
+                        raise ValueError(error_msg)
+                    logger.debug(
+                        f"{fn_name}: Using per-request {spec.name} URL "
+                        f"from {spec.url_header} header: {url_from_header}"
+                    )
+                    global_config_fallback = dataclasses.replace(
+                        global_config_fallback, url=url_from_header
+                    )
+                else:
+                    error_msg = (
+                        f"{spec.name} URL is not configured. "
+                        f"Set {spec.url_header} header or configure the "
+                        f"{spec.name.upper()}_URL environment variable."
+                    )
+                    raise ValueError(error_msg)
+            global_config_fallback = _with_request_passthrough_headers(
+                request, spec, global_config_fallback
+            )
         return spec.fetcher_class(config=global_config_fallback)
 
     logger.error(f"{spec.name} configuration could not be resolved.")

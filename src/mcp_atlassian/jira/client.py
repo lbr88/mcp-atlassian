@@ -3,6 +3,7 @@
 import logging
 import os
 from typing import Any, Literal
+from urllib.parse import unquote
 
 from atlassian import Jira
 from requests import Session
@@ -10,16 +11,26 @@ from requests.exceptions import ConnectionError as RequestsConnectionError
 
 from mcp_atlassian.exceptions import MCPAtlassianAuthenticationError
 from mcp_atlassian.preprocessing import JiraPreprocessor
+from mcp_atlassian.utils.http import (
+    configure_circuit_breaker,
+    configure_concurrency,
+    configure_rate_limit,
+    configure_retry,
+)
 from mcp_atlassian.utils.logging import (
     get_masked_session_headers,
     log_config_param,
     mask_sensitive,
 )
 from mcp_atlassian.utils.oauth import configure_oauth_session
+from mcp_atlassian.utils.proxy import apply_proxy_configuration
 from mcp_atlassian.utils.ssl import configure_ssl_verification
+from mcp_atlassian.utils.ssrf_adapter import mount_ssrf_pinning
+from mcp_atlassian.utils.urls import make_ssrf_redirect_hook
+from mcp_atlassian.utils.user_agent import get_default_user_agent
 
 from ..models.jira.adf import markdown_to_adf
-from .config import JiraConfig
+from .config import JiraConfig, normalize_project_key
 
 # Configure logging
 logger = logging.getLogger("mcp-jira")
@@ -46,6 +57,7 @@ class JiraClient:
         """
         # Load configuration from environment variables if not provided
         self.config = config or JiraConfig.from_env()
+        transport_url = self.config.url
 
         # Initialize the Jira client based on auth type
         if self.config.auth_type == "oauth":
@@ -78,6 +90,7 @@ class JiraClient:
                 # Cloud: use the Atlassian Cloud API URL
                 api_url = f"https://api.atlassian.com/ex/jira/{self.config.oauth_config.cloud_id}"
                 is_cloud = True
+            transport_url = api_url
 
             # Initialize Jira with the session
             self.jira = Jira(
@@ -100,6 +113,35 @@ class JiraClient:
                 verify_ssl=self.config.ssl_verify,
                 timeout=self.config.timeout,
             )
+        elif self.config.auth_type == "cert":
+            logger.debug(
+                f"Initializing Jira client with mTLS certificate auth. "
+                f"URL: {self.config.url}, "
+                f"Cert configured: {bool(self.config.client_cert)}"
+            )
+            self.jira = Jira(
+                url=self.config.url,
+                cloud=self.config.is_cloud,
+                verify_ssl=self.config.ssl_verify,
+                timeout=self.config.timeout,
+            )
+            self.jira._session.trust_env = False
+        elif self.config.auth_type == "external":
+            logger.debug(
+                f"Initializing Jira client in external auth passthrough mode. "
+                f"URL: {self.config.url}"
+            )
+            session = Session()
+            session.trust_env = False
+            self.jira = Jira(
+                url=self.config.url,
+                session=session,
+                cloud=self.config.is_cloud,
+                verify_ssl=self.config.ssl_verify,
+                timeout=self.config.timeout,
+            )
+            # Ensure no Authorization header is carried over from defaults
+            self.jira._session.headers.pop("Authorization", None)
         else:  # basic auth
             logger.debug(
                 f"Initializing Jira client with Basic auth. "
@@ -125,34 +167,61 @@ class JiraClient:
         if self.config.auth_type in ("pat", "oauth"):
             self.jira._session.trust_env = False
 
+        if self.config.no_proxy and isinstance(self.config.no_proxy, str):
+            os.environ["NO_PROXY"] = self.config.no_proxy
+            log_config_param(logger, "Jira", "NO_PROXY", self.config.no_proxy)
+
         # Configure SSL verification using the shared utility
         configure_ssl_verification(
             service_name="Jira",
-            url=self.config.url,
+            url=transport_url,
             session=self.jira._session,
             ssl_verify=self.config.ssl_verify,
             client_cert=self.config.client_cert,
             client_key=self.config.client_key,
             client_key_password=self.config.client_key_password,
+            no_proxy=self.config.no_proxy,
         )
 
-        # Proxy configuration
-        proxies = {}
-        if self.config.http_proxy:
-            proxies["http"] = self.config.http_proxy
-        if self.config.https_proxy:
-            proxies["https"] = self.config.https_proxy
-        if self.config.socks_proxy:
-            proxies["socks"] = self.config.socks_proxy
-        if proxies:
-            self.jira._session.proxies.update(proxies)
-            for k, v in proxies.items():
-                log_config_param(
-                    logger, "Jira", f"{k.upper()}_PROXY", v, sensitive=True
-                )
-        if self.config.no_proxy and isinstance(self.config.no_proxy, str):
-            os.environ["NO_PROXY"] = self.config.no_proxy
-            log_config_param(logger, "Jira", "NO_PROXY", self.config.no_proxy)
+        # Validate redirects for SSRF on every outbound call from this session
+        # (covers direct _session.get() paths and global/stdio fetchers, not just
+        # the per-user HTTP path).
+        self.jira._session.hooks["response"].append(make_ssrf_redirect_hook())
+        # Pin DNS resolution against rebinding: resolve+validate once and connect
+        # to that address, closing the validate→reconnect TOCTOU. Preserves TLS SNI.
+        # Config URLs can come from request headers; only the fixed Cloud OAuth
+        # gateway is additionally trusted. Operator URLs are trusted via the env.
+        mount_ssrf_pinning(self.jira._session, "https://api.atlassian.com")
+
+        # atlassian-python-api's built-in retry_with_header performs an UNBOUNDED,
+        # header-driven retry (``time.sleep(int(Retry-After)); retry``). It melts
+        # down when a gateway returns ``Retry-After: 0`` — endless zero-delay retries
+        # that the server then treats as anonymous, surfacing a spurious 401 — and it
+        # now overlaps with configure_retry() below. Disable it so the bounded
+        # urllib3 Retry policy is the single source of retry truth.
+        self.jira.retry_with_header = False
+
+        # Apply opt-in HTTP hardening after SSL setup and after the pinning
+        # adapter is mounted: these wrappers patch send() in place on whatever
+        # adapters are mounted now, so mounting the pinning adapter later would
+        # silently drop them.
+        configure_retry(self.jira._session, service="Jira")
+        configure_concurrency(self.jira._session, service="Jira")
+        configure_rate_limit(self.jira._session, service="Jira")
+        configure_circuit_breaker(self.jira._session, service="Jira")
+
+        self.jira._session = apply_proxy_configuration(
+            logger=logger,
+            service_name="Jira",
+            session=self.jira._session,
+            config=self.config,
+            target_url=transport_url,
+        )
+
+        # Set an explicit User-Agent so requests aren't blocked by WAFs that
+        # reject the default ``python-requests/X.Y`` header. User-supplied
+        # custom headers below can still override this.
+        self.jira._session.headers["User-Agent"] = get_default_user_agent()
 
         # Apply custom headers if configured
         if self.config.custom_headers:
@@ -167,7 +236,7 @@ class JiraClient:
         self._current_user_account_id = None
 
         # Test authentication during initialization (in debug mode only)
-        if logger.isEnabledFor(logging.DEBUG):
+        if logger.isEnabledFor(logging.DEBUG) and self.config.auth_type != "external":
             try:
                 self._validate_authentication()
             except MCPAtlassianAuthenticationError:
@@ -254,7 +323,7 @@ class JiraClient:
 
         if self.config.is_cloud:
             try:
-                return markdown_to_adf(markdown_text)
+                return markdown_to_adf(markdown_text, jira_base_url=self.config.url)
             except Exception as e:
                 logger.warning(f"Error converting markdown to ADF: {e}")
                 return {
@@ -273,6 +342,40 @@ class JiraClient:
         except Exception as e:
             logger.warning(f"Error converting markdown to Jira format: {str(e)}")
             return markdown_text
+
+    @staticmethod
+    def _project_key_from_issue_key(issue_key: str) -> str:
+        """Extract the project key from an issue key (e.g. 'CC-123' -> 'CC').
+
+        Normalizes its own input the same way the configured keys are
+        normalized (surrounding whitespace and invisible characters, on the
+        issue key AND on the extracted key) so that padded inputs like
+        ' CC-1', '\\tCC-1' or 'CC -1' cannot slip past callers that
+        compare the result against a set of clean project keys. A
+        defense-in-depth check must not rely on the downstream API to
+        reject whitespace-padded keys, and both sides of the comparison have
+        to normalize identically or the guard silently stops matching.
+        """
+        # requests decodes percent-encoded unreserved characters while
+        # preparing URLs. Match the representation that downstream reads and
+        # writes can reach, so CC%2D1 or %43C-1 cannot evade a CC project guard.
+        request_key = unquote(issue_key)
+        return normalize_project_key(
+            normalize_project_key(request_key).split("-", 1)[0]
+        )
+
+    def _is_internal_only_project(self, issue_key: str) -> bool:
+        """Check whether issue_key's project is in JIRA_INTERNAL_ONLY_PROJECTS.
+
+        Returns False (no-op) whenever the env var is unset/empty, which is
+        the default for every deployment that hasn't opted in.
+        """
+        if not self.config.internal_only_projects:
+            return False
+        return (
+            self._project_key_from_issue_key(issue_key)
+            in self.config.internal_only_projects
+        )
 
     def _post_api3(
         self,
@@ -382,7 +485,57 @@ class JiraClient:
         if description:
             payload["description"] = description
         logger.info(f"Creating Jira version: {payload}")
-        result = self.jira.post("/rest/api/3/version", json=payload)
+        result = self.jira.post("/rest/api/2/version", json=payload)
+        if not isinstance(result, dict):
+            error_message = f"Unexpected response from Jira API: {result}"
+            raise ValueError(error_message)
+        return result
+
+    def update_version(
+        self,
+        version_id: str,
+        name: str | None = None,
+        description: str | None = None,
+        start_date: str | None = None,
+        release_date: str | None = None,
+        archived: bool | None = None,
+        released: bool | None = None,
+    ) -> dict[str, Any]:
+        """
+        Update an existing version in a Jira project.
+
+        Only fields that are not None are sent in the request, so callers can
+        toggle a single attribute (e.g. archived) without touching the others.
+
+        Args:
+            version_id: The numeric ID of the version to update.
+            name: New name for the version (optional).
+            description: New description for the version (optional).
+            start_date: New start date (YYYY-MM-DD, optional).
+            release_date: New release date (YYYY-MM-DD, optional).
+            archived: Archived flag (optional).
+            released: Released flag (optional).
+
+        Returns:
+            The updated version object as returned by Jira.
+        """
+        payload: dict[str, Any] = {}
+        if name is not None:
+            payload["name"] = name
+        if description is not None:
+            payload["description"] = description
+        if start_date is not None:
+            payload["startDate"] = start_date
+        if release_date is not None:
+            payload["releaseDate"] = release_date
+        if archived is not None:
+            payload["archived"] = archived
+        if released is not None:
+            payload["released"] = released
+        if not payload:
+            raise ValueError("update_version requires at least one field to update")
+        logger.info(f"Updating Jira version {version_id}: {payload}")
+        result = self.jira.put(f"/rest/api/2/version/{version_id}", data=payload)
         if not isinstance(result, dict):
             error_message = f"Unexpected response from Jira API: {result}"
             raise ValueError(error_message)

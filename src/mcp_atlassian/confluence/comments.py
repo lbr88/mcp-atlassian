@@ -1,6 +1,8 @@
 """Module for Confluence comment operations."""
 
+import json
 import logging
+import time
 from typing import Any
 
 import requests
@@ -15,14 +17,60 @@ logger = logging.getLogger("mcp-atlassian")
 class CommentsMixin(ConfluenceClient):
     """Mixin for Confluence comment operations."""
 
+    def _get_all_v1_page_comments(
+        self, page_id: str, *, expand: str
+    ) -> list[dict[str, Any]]:
+        """Fetch every page of comments from the Confluence v1 API."""
+        response = self.confluence.get_page_comments(
+            content_id=page_id,
+            expand=expand,
+            depth="all",
+        )
+        results = list(response.get("results", []))
+        start = int(response.get("start", 0))
+
+        while response.get("_links", {}).get("next"):
+            page_size = int(response.get("size", len(response.get("results", []))))
+            if page_size <= 0:
+                break
+            start += page_size
+            limit = int(response.get("limit", 25))
+            response = self.confluence.get_page_comments(
+                content_id=page_id,
+                expand=expand,
+                depth="all",
+                start=start,
+                limit=limit,
+            )
+            results.extend(response.get("results", []))
+
+        return results
+
     @property
     def _v2_adapter(self) -> ConfluenceV2Adapter | None:
-        """Get v2 API adapter for OAuth authentication.
+        """Get v2 API adapter for supported Confluence Cloud authentication.
 
         Returns:
-            ConfluenceV2Adapter instance if OAuth is configured, None otherwise
+            ConfluenceV2Adapter for Cloud OAuth/PAT, None otherwise
         """
-        if self.config.auth_type == "oauth" and self.config.is_cloud:
+        if self.config.is_cloud and self.config.auth_type in ("oauth", "pat"):
+            return ConfluenceV2Adapter(
+                session=self.confluence._session, base_url=self.confluence.url
+            )
+        return None
+
+    @property
+    def _inline_v2_adapter(self) -> ConfluenceV2Adapter | None:
+        """Get v2 API adapter for inline comment operations.
+
+        Inline comments require the v2 API on all Cloud instances because the
+        v1 ``POST /rest/api/content/`` endpoint does not support inline comment
+        creation on Confluence Cloud regardless of auth method.
+
+        Returns:
+            ConfluenceV2Adapter instance if this is a Cloud instance, None otherwise
+        """
+        if self.config.is_cloud:
             return ConfluenceV2Adapter(
                 session=self.confluence._session, base_url=self.confluence.url
             )
@@ -48,13 +96,17 @@ class CommentsMixin(ConfluenceClient):
             space_key = page.get("space", {}).get("key", "")
 
             # Get comments with expanded content
-            comments_response = self.confluence.get_page_comments(
-                content_id=page_id, expand="body.view.value,version", depth="all"
+            raw_comments = self._get_all_v1_page_comments(
+                page_id,
+                expand=(
+                    "body.view.value,version,container,ancestors,"
+                    "extensions.inlineProperties,extensions.resolution"
+                ),
             )
 
             # Process each comment
             comment_models = []
-            for comment_data in comments_response.get("results", []):
+            for comment_data in raw_comments:
                 # Get the content based on format
                 body = comment_data["body"]["view"]["value"]
                 processed_html, processed_markdown = (
@@ -65,6 +117,12 @@ class CommentsMixin(ConfluenceClient):
 
                 # Create a copy of the comment data to modify
                 modified_comment_data = comment_data.copy()
+                if "body" in modified_comment_data:
+                    modified_comment_data["body"] = modified_comment_data["body"].copy()
+                    if "view" in modified_comment_data["body"]:
+                        modified_comment_data["body"]["view"] = modified_comment_data[
+                            "body"
+                        ]["view"].copy()
 
                 # Modify the body value based on the return format
                 if "body" not in modified_comment_data:
@@ -172,13 +230,18 @@ class CommentsMixin(ConfluenceClient):
                 )
                 space_key = ""
             else:
-                # v1 API: POST /rest/api/content/ with container type "comment"
+                # v1 API: thread replies under the parent page with ancestors,
+                # not as a direct child of the parent comment.
+                page_id = self._resolve_page_id_for_parent_comment(comment_id)
+                page = self.confluence.get_page_by_id(page_id=page_id, expand="space")
+                space_key = page.get("space", {}).get("key", "")
                 data: dict[str, Any] = {
                     "type": "comment",
                     "container": {
-                        "id": comment_id,
-                        "type": "comment",
+                        "id": page_id,
+                        "type": "page",
                     },
+                    "ancestors": [{"id": comment_id}],
                     "body": {
                         "storage": {
                             "value": content,
@@ -206,6 +269,230 @@ class CommentsMixin(ConfluenceClient):
             logger.debug("Full exception details for comment reply:", exc_info=True)
             return None
 
+    @staticmethod
+    def _page_id_from_reference(reference: Any) -> str | None:
+        """Return a page ID from an expanded Confluence content reference."""
+        if not isinstance(reference, dict) or reference.get("type") != "page":
+            return None
+
+        page_id = reference.get("id")
+        return str(page_id) if page_id is not None else None
+
+    def _resolve_page_id_for_parent_comment(self, comment_id: str) -> str:
+        """Resolve the page containing a parent comment, including nested replies.
+
+        Args:
+            comment_id: The ID of the parent comment.
+
+        Returns:
+            The page ID that owns the comment thread.
+
+        Raises:
+            ValueError: If the parent response contains no page reference.
+        """
+        parent = self.confluence.get_page_by_id(
+            page_id=comment_id, expand="container,ancestors"
+        )
+
+        page_id = self._page_id_from_reference(parent.get("container"))
+        if page_id:
+            return page_id
+
+        ancestors = parent.get("ancestors")
+        if isinstance(ancestors, list):
+            for ancestor in reversed(ancestors):
+                page_id = self._page_id_from_reference(ancestor)
+                if page_id:
+                    return page_id
+
+        raise ValueError(f"Could not resolve page for parent comment {comment_id}")
+
+    def get_inline_comments(
+        self, page_id: str, *, return_markdown: bool = True
+    ) -> list[ConfluenceComment]:
+        """Get inline comments for a specific page.
+
+        Args:
+            page_id: The ID of the page to get inline comments from
+            return_markdown: When True, returns content in markdown format,
+                           otherwise returns raw HTML (keyword-only)
+
+        Returns:
+            List of ConfluenceComment models with location="inline"
+        """
+        try:
+            v2_adapter = self._inline_v2_adapter
+            if v2_adapter:
+                raw_comments = v2_adapter.get_inline_comments(page_id)
+                space_key = ""
+            else:
+                # v1: fetch all child comments then filter by location=inline
+                page = self.confluence.get_page_by_id(page_id=page_id, expand="space")
+                space_key = page.get("space", {}).get("key", "")
+                all_comments = self._get_all_v1_page_comments(
+                    page_id,
+                    expand=(
+                        "body.view.value,version,container,ancestors,"
+                        "extensions.inlineProperties,extensions.resolution"
+                    ),
+                )
+                raw_comments = [
+                    c
+                    for c in all_comments
+                    if c.get("extensions", {}).get("location") == "inline"
+                ]
+
+            comment_models = []
+            for comment_data in raw_comments:
+                body = comment_data.get("body", {}).get("view", {}).get("value", "")
+                processed_html, processed_markdown = (
+                    self.preprocessor.process_html_content(
+                        body, space_key=space_key, confluence_client=self.confluence
+                    )
+                )
+
+                modified_comment_data = comment_data.copy()
+                if "body" in modified_comment_data:
+                    modified_comment_data["body"] = modified_comment_data["body"].copy()
+                    if "view" in modified_comment_data["body"]:
+                        modified_comment_data["body"]["view"] = modified_comment_data[
+                            "body"
+                        ]["view"].copy()
+                if "body" not in modified_comment_data:
+                    modified_comment_data["body"] = {}
+                if "view" not in modified_comment_data["body"]:
+                    modified_comment_data["body"]["view"] = {}
+
+                modified_comment_data["body"]["view"]["value"] = (
+                    processed_markdown if return_markdown else processed_html
+                )
+
+                comment_models.append(
+                    ConfluenceComment.from_api_response(
+                        modified_comment_data, base_url=self.config.url
+                    )
+                )
+
+            return comment_models
+
+        except KeyError as e:
+            logger.error(f"Missing key in inline comment data: {str(e)}")
+            raise
+        except requests.RequestException as e:
+            logger.error(f"Network error when fetching inline comments: {str(e)}")
+            raise
+        except (ValueError, TypeError) as e:
+            logger.error(f"Error processing inline comment data: {str(e)}")
+            raise
+        except Exception as e:  # noqa: BLE001 - Intentional fallback with full logging
+            logger.error(f"Unexpected error fetching inline comments: {str(e)}")
+            logger.debug("Full exception details for inline comments:", exc_info=True)
+            raise
+
+    def add_inline_comment(
+        self,
+        page_id: str,
+        content: str,
+        text_selection: str,
+        text_selection_match_count: int = 1,
+        text_selection_match_index: int = 0,
+    ) -> ConfluenceComment | None:
+        """Add an inline comment anchored to a text selection on a page.
+
+        For Cloud instances, uses the v2 API (POST /api/v2/inline-comments).
+        For Server/DC, uses the v1 API (POST /rest/api/content/).
+
+        Args:
+            page_id: The ID of the page to add the inline comment to
+            content: The comment content (Markdown or HTML/storage format)
+            text_selection: The text on the page to anchor the comment to
+            text_selection_match_count: How many times the text appears
+                on the page
+            text_selection_match_index: Zero-based index of which occurrence
+                to anchor to
+
+        Returns:
+            ConfluenceComment object if successful, None otherwise
+        """
+        try:
+            # Convert markdown to Confluence storage format if needed
+            if not content.strip().startswith("<"):
+                content = self.preprocessor.markdown_to_confluence_storage(content)
+
+            v2_adapter = self._inline_v2_adapter
+            if v2_adapter:
+                response = v2_adapter.create_inline_comment(
+                    page_id=page_id,
+                    body=content,
+                    text_selection=text_selection,
+                    text_selection_match_count=text_selection_match_count,
+                    text_selection_match_index=text_selection_match_index,
+                )
+                space_key = ""
+            else:
+                # v1 API: POST /rest/api/content/ with inline location
+                #
+                # Confluence Server/DC requires four additional fields in
+                # inlineProperties that the frontend editor normally supplies
+                # when a user highlights text. Omitting any of them yields
+                # HTTP 400 with validation keys matchIndex / lastFetchTime /
+                # serializedHighlights. Field formats (discovered empirically
+                # against Confluence DC 8.x):
+                #
+                # - numMatches:          int, total occurrences on the page
+                # - matchIndex:          int, zero-based index of the match
+                # - lastFetchTime:       str, Unix epoch in **milliseconds**
+                # - serializedHighlights: str, JSON-encoded nested array of
+                #                         the form [["<selected text>"]]
+                last_fetch_time_ms = str(int(time.time() * 1000))
+                serialized_highlights = json.dumps([[text_selection]])
+                data: dict[str, Any] = {
+                    "type": "comment",
+                    "container": {
+                        "id": page_id,
+                        "type": "page",
+                    },
+                    "body": {
+                        "storage": {
+                            "value": content,
+                            "representation": "storage",
+                        },
+                    },
+                    "extensions": {
+                        "location": "inline",
+                        "inlineProperties": {
+                            "originalSelection": text_selection,
+                            "numMatches": text_selection_match_count,
+                            "matchIndex": text_selection_match_index,
+                            "lastFetchTime": last_fetch_time_ms,
+                            "serializedHighlights": serialized_highlights,
+                        },
+                    },
+                }
+                page = self.confluence.get_page_by_id(page_id=page_id, expand="space")
+                space_key = page.get("space", {}).get("key", "")
+                response = self.confluence.post("rest/api/content/", data=data)
+
+            if not response:
+                logger.error("Failed to add inline comment: empty response")
+                return None
+
+            return self._process_comment_response(response, space_key)
+
+        except requests.RequestException as e:
+            logger.error(f"Network error when adding inline comment: {str(e)}")
+            return None
+        except (ValueError, TypeError, KeyError) as e:
+            logger.error(f"Error processing inline comment data: {str(e)}")
+            return None
+        except Exception as e:  # noqa: BLE001 - Intentional fallback with full logging
+            logger.error(f"Unexpected error adding inline comment: {str(e)}")
+            logger.debug(
+                "Full exception details for adding inline comment:",
+                exc_info=True,
+            )
+            return None
+
     def _process_comment_response(
         self, response: dict[str, Any], space_key: str
     ) -> ConfluenceComment:
@@ -218,13 +505,33 @@ class CommentsMixin(ConfluenceClient):
         Returns:
             Processed ConfluenceComment instance
         """
+        body = response.get("body") or {}
+        if not isinstance(body, dict):
+            body = {}
+
+        view = body.get("view") or {}
+        if not isinstance(view, dict):
+            view = {}
+
+        body_html = view.get("value") or ""
+        if not body_html:
+            storage = body.get("storage") or {}
+            if isinstance(storage, dict):
+                body_html = storage.get("value") or ""
+
         _, processed_markdown = self.preprocessor.process_html_content(
-            response.get("body", {}).get("view", {}).get("value", ""),
+            body_html,
             space_key=space_key,
             confluence_client=self.confluence,
         )
 
         modified_response = response.copy()
+        if "body" in modified_response:
+            modified_response["body"] = modified_response["body"].copy()
+            if "view" in modified_response["body"]:
+                modified_response["body"]["view"] = modified_response["body"][
+                    "view"
+                ].copy()
         if "body" not in modified_response:
             modified_response["body"] = {}
         if "view" not in modified_response["body"]:

@@ -183,7 +183,7 @@ class FieldsMixin(JiraClient, EpicOperationsProto, UsersOperationsProto):
         Get required fields for creating an issue of a specific type in a project.
 
         Args:
-            issue_type: The issue type (e.g., 'Bug', 'Story', 'Epic')
+            issue_type: The issue type name or ID (e.g., 'Bug' or '10001')
             project_key: The project key (e.g., 'PROJ')
 
         Returns:
@@ -202,7 +202,7 @@ class FieldsMixin(JiraClient, EpicOperationsProto, UsersOperationsProto):
             return self._required_fields_cache[cache_key]
 
         try:
-            # Step 1: Get the ID for the given issue type name within the project
+            # Step 1: Resolve the issue type by stable ID or display name.
             if not hasattr(self, "get_project_issue_types"):
                 logger.error(
                     "get_project_issue_types method not available. Cannot resolve issue type ID."
@@ -212,8 +212,13 @@ class FieldsMixin(JiraClient, EpicOperationsProto, UsersOperationsProto):
             all_issue_types = self.get_project_issue_types(project_key)
             issue_type_id = None
             for it in all_issue_types:
-                if it.get("name", "").lower() == issue_type.lower():
-                    issue_type_id = it.get("id")
+                candidate_id = it.get("id")
+                candidate_name = it.get("name", "")
+                if (candidate_id is not None and str(candidate_id) == issue_type) or (
+                    isinstance(candidate_name, str)
+                    and candidate_name.lower() == issue_type.lower()
+                ):
+                    issue_type_id = candidate_id
                     break
 
             if not issue_type_id:
@@ -498,6 +503,18 @@ class FieldsMixin(JiraClient, EpicOperationsProto, UsersOperationsProto):
             }.get(schema_type)
             if schema_handler:
                 return schema_handler(value, field_id, field_definition)
+
+        # Rich-text custom fields accept Markdown the same way the description field does:
+        # convert to ADF on Cloud, wiki markup on Server. The ':textarea' custom type is the
+        # reliable signal for a multi-line rich-text field; single-line ':textfield' is left
+        # as-is. Without this, Markdown is sent verbatim and renders as literal text (#554).
+        if (
+            schema_type == "string"
+            and isinstance(schema_custom, str)
+            and schema_custom.endswith(":textarea")
+            and isinstance(value, str)
+        ):
+            return self._markdown_to_jira(value)
 
         # 3. Default: return as-is
         return value

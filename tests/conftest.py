@@ -6,6 +6,11 @@ across all test modules. It integrates with the new test utilities framework
 to provide efficient, reusable test fixtures.
 """
 
+import shutil
+import uuid
+from collections.abc import Generator
+from pathlib import Path
+
 import pytest
 
 from tests.utils.factories import (
@@ -18,6 +23,20 @@ from tests.utils.mocks import MockAtlassianClient, MockEnvironment
 
 # Restrict anyio tests to asyncio backend only (FastMCP client requires asyncio)
 pytest_plugins = ("anyio",)
+
+
+@pytest.fixture
+def workspace_tmp_path() -> Generator[Path, None, None]:
+    """A temp directory *inside* the workspace (CWD).
+
+    ``upload_attachment`` / ``content_file`` confine caller-supplied paths to
+    the working directory, so files fed to those tools must live under it —
+    pytest's ``tmp_path`` (outside CWD) is rejected by design.
+    """
+    d = Path.cwd() / f".e2e-tmp-{uuid.uuid4().hex[:8]}"
+    d.mkdir()
+    yield d
+    shutil.rmtree(d, ignore_errors=True)
 
 
 @pytest.fixture(params=["asyncio"])

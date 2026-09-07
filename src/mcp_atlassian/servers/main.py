@@ -4,14 +4,14 @@ import base64
 import json
 import logging
 import os
-from collections.abc import AsyncIterator, MutableMapping
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any, Literal, Optional
 from urllib.parse import urlparse
 
-from cachetools import TTLCache
 from fastmcp import FastMCP
 from fastmcp import settings as fastmcp_settings
+from fastmcp.exceptions import NotFoundError
 from fastmcp.server.event_store import EventStore
 from fastmcp.server.http import StarletteWithLifespan
 from fastmcp.tools import Tool as FastMCPTool
@@ -21,9 +21,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from mcp_atlassian.confluence import ConfluenceFetcher
 from mcp_atlassian.confluence.config import ConfluenceConfig
-from mcp_atlassian.jira import JiraFetcher
 from mcp_atlassian.jira.config import JiraConfig
 from mcp_atlassian.utils.env import is_env_truthy
 from mcp_atlassian.utils.environment import get_available_services
@@ -46,6 +44,7 @@ from mcp_atlassian.utils.urls import is_atlassian_cloud_url, validate_url_for_ss
 from .client_storage import build_oauth_client_storage_from_env
 from .confluence import confluence_mcp
 from .context import MainAppContext
+from .error_handling import ErrorPreservingFastMCP
 from .jira import jira_mcp
 from .oauth_proxy import HardenedOAuthProxy, parse_env_list
 
@@ -70,9 +69,10 @@ def _sanitize_schema_for_compatibility(tool: MCPTool) -> MCPTool:
     Vertex AI / Google ADK rejecting ``anyOf`` alongside ``default`` or
     ``description`` fields (issues #640, #733).
 
-    The transform is intentionally conservative — it only flattens unions
-    of exactly ``[{"type": <primitive>}, {"type": "null"}]`` so that
-    complex / nested schemas are left untouched.
+    The transform is intentionally conservative — it only flattens nullable
+    unions with exactly one non-null branch so that complex multi-type schemas
+    are left untouched. FastMCP/Pydantic can emit nested nullable unions on
+    Python 3.10, so nullable branches are resolved recursively.
 
     Note: Only top-level ``properties`` are processed.  Nested schemas
     (e.g. ``items`` of arrays or ``properties`` of sub-objects) are not
@@ -93,23 +93,40 @@ def _sanitize_schema_for_compatibility(tool: MCPTool) -> MCPTool:
     if not properties or not isinstance(properties, dict):
         return tool
 
+    def resolve_nullable_schema(schema_def: dict[str, Any]) -> dict[str, Any] | None:
+        any_of = schema_def.get("anyOf")
+        if not any_of or not isinstance(any_of, list):
+            return None
+
+        # Only flatten nullable unions with exactly one non-null branch.
+        non_null = [v for v in any_of if v != {"type": "null"}]
+        null_present = any(v == {"type": "null"} for v in any_of)
+        if not null_present or len(non_null) != 1 or not isinstance(non_null[0], dict):
+            return None
+
+        candidate = non_null[0]
+        nested = resolve_nullable_schema(candidate)
+        resolved = nested if nested is not None else candidate
+        if "type" not in resolved:
+            return None
+
+        return {key: value for key, value in resolved.items() if key != "anyOf"}
+
     for _prop_name, prop_def in properties.items():
         if not isinstance(prop_def, dict):
             continue
 
-        any_of = prop_def.get("anyOf")
-        if not any_of or not isinstance(any_of, list):
+        resolved_schema = resolve_nullable_schema(prop_def)
+        if resolved_schema is None:
             continue
 
-        # Only flatten simple nullable unions: [{"type": T}, {"type": "null"}]
-        non_null = [v for v in any_of if v != {"type": "null"}]
-        null_present = any(v == {"type": "null"} for v in any_of)
-
-        if null_present and len(non_null) == 1 and "type" in non_null[0]:
-            # Collapse: pull the real type up, drop anyOf
-            resolved_type = non_null[0]["type"]
-            prop_def.pop("anyOf")
-            prop_def["type"] = resolved_type
+        # Collapse: pull the real schema up, drop anyOf, and preserve outer
+        # metadata such as description/default when both levels provide it.
+        prop_def.pop("anyOf")
+        for key, value in resolved_schema.items():
+            if key in {"default", "description"} and key in prop_def:
+                continue
+            prop_def[key] = value
 
     return tool
 
@@ -189,7 +206,7 @@ async def main_lifespan(app: FastMCP[MainAppContext]) -> AsyncIterator[dict[str,
         logger.info("Main Atlassian MCP server lifespan shutdown complete.")
 
 
-class AtlassianMCP(FastMCP[MainAppContext]):
+class AtlassianMCP(ErrorPreservingFastMCP[MainAppContext]):
     """Custom FastMCP server class for Atlassian integration with tool filtering."""
 
     _active_streamable_http_path: str | None = None
@@ -209,14 +226,15 @@ class AtlassianMCP(FastMCP[MainAppContext]):
             return self._active_streamable_http_path
         return self._normalize_http_path(fastmcp_settings.streamable_http_path)
 
-    async def _list_tools_mcp(self) -> list[MCPTool]:
-        # Filter tools based on enabled_tools, read_only mode, and service configuration from the lifespan context.
+    def _tool_filter_context(self) -> dict[str, Any] | None:
+        """Gather the per-request tool-enablement context (read-only mode, enabled
+        tools/toolsets, service availability) from the lifespan/request context.
+
+        Returns None when the lifespan context is unavailable.
+        """
         req_context = self._mcp_server.request_context
         if req_context is None or req_context.lifespan_context is None:
-            logger.warning(
-                "Lifespan context not available during _list_tools_mcp call."
-            )
-            return []
+            return None
 
         lifespan_ctx_dict = req_context.lifespan_context
         app_lifespan_state: MainAppContext | None = (
@@ -241,84 +259,123 @@ class AtlassianMCP(FastMCP[MainAppContext]):
         )
 
         header_based_services = {"jira": False, "confluence": False}
+        service_headers: dict[str, str] = {}
         request = getattr(req_context, "request", None)
         if request is not None:
-            service_headers = getattr(request.state, "atlassian_service_headers", {})
-            if service_headers:
+            request_service_headers = getattr(
+                request.state, "atlassian_service_headers", {}
+            )
+            if isinstance(request_service_headers, dict) and request_service_headers:
+                service_headers = request_service_headers
                 header_based_services = get_available_services(service_headers)
-                logger.debug(
-                    f"Header-based service availability: {header_based_services}"
-                )
 
-        logger.debug(
-            f"_list_tools_mcp: read_only={read_only}, enabled_tools_filter={enabled_tools_filter}, header_services={header_based_services}"
+        jira_config = (
+            app_lifespan_state.full_jira_config if app_lifespan_state else None
         )
+        jira_url_header = service_headers.get("X-Atlassian-Jira-Url")
+        jira_is_cloud: bool | None = None
+        if jira_url_header:
+            jira_is_cloud = is_atlassian_cloud_url(jira_url_header)
+        elif jira_config is not None:
+            jira_is_cloud = bool(jira_config.is_cloud)
 
-        all_tools: dict[str, FastMCPTool] = await self.get_tools()
+        return {
+            "read_only": read_only,
+            "enabled_tools_filter": enabled_tools_filter,
+            "enabled_toolsets_filter": enabled_toolsets_filter,
+            "app_lifespan_state": app_lifespan_state,
+            "header_based_services": header_based_services,
+            "jira_is_cloud": jira_is_cloud,
+        }
+
+    def _is_tool_authorized(
+        self, registered_name: str, tool_obj: FastMCPTool, ctx: dict[str, Any]
+    ) -> bool:
+        """Authorization boundaries enforced at BOTH listing and call time: the
+        ENABLED_TOOLS allowlist, the enabled toolsets, and read-only mode.
+
+        These are security boundaries — a tool excluded here must not be invocable
+        by name. (Service availability, below, is a listing-only UX filter: an
+        unavailable-service tool simply fails naturally if called.)
+        """
+        tool_tags = tool_obj.tags
+        if not should_include_tool_by_toolset(
+            tool_tags, ctx["enabled_toolsets_filter"]
+        ):
+            return False
+        if not should_include_tool(registered_name, ctx["enabled_tools_filter"]):
+            return False
+        if ctx["read_only"] and "write" in tool_tags:
+            return False
+        return True
+
+    @staticmethod
+    def _is_tool_supported_on_deployment(
+        tool_obj: FastMCPTool, ctx: dict[str, Any]
+    ) -> bool:
+        """Return whether a tool is supported by the configured deployment."""
+        tool_tags = tool_obj.tags
+        if "cloud_only" in tool_tags and "jira" in tool_tags:
+            return ctx["jira_is_cloud"] is not False
+        return True
+
+    def _is_tool_enabled(
+        self, registered_name: str, tool_obj: FastMCPTool, ctx: dict[str, Any]
+    ) -> bool:
+        """Listing filter: the tool is authorized AND its backing service is
+        configured/available (the latter is a listing-only graceful-hide)."""
+        if not self._is_tool_authorized(registered_name, tool_obj, ctx):
+            return False
+        if not self._is_tool_supported_on_deployment(tool_obj, ctx):
+            return False
+
+        app_lifespan_state = ctx["app_lifespan_state"]
+        header_based_services = ctx["header_based_services"]
+        tool_tags = tool_obj.tags
+
+        is_jira_tool = "jira" in tool_tags
+        is_confluence_tool = "confluence" in tool_tags
+        if app_lifespan_state:
+            jira_available = (
+                app_lifespan_state.full_jira_config is not None
+            ) or header_based_services.get("jira", False)
+            confluence_available = (
+                app_lifespan_state.full_confluence_config is not None
+            ) or header_based_services.get("confluence", False)
+            if is_jira_tool and not jira_available:
+                return False
+            if is_confluence_tool and not confluence_available:
+                return False
+        elif is_jira_tool or is_confluence_tool:
+            if is_jira_tool and not header_based_services.get("jira", False):
+                return False
+            if is_confluence_tool and not header_based_services.get(
+                "confluence", False
+            ):
+                return False
+        return True
+
+    async def _list_tools_mcp(self) -> list[MCPTool]:
+        # Filter tools based on enabled_tools, read_only mode, and service configuration from the lifespan context.
+        ctx = self._tool_filter_context()
+        if ctx is None:
+            logger.warning(
+                "Lifespan context not available during _list_tools_mcp call."
+            )
+            return []
+
+        all_tools: list[FastMCPTool] = await self.list_tools()
         logger.debug(
-            f"Aggregated {len(all_tools)} tools before filtering: {list(all_tools.keys())}"
+            f"Aggregated {len(all_tools)} tools before filtering: "
+            f"{[tool.name for tool in all_tools]}"
         )
 
         filtered_tools: list[MCPTool] = []
-        for registered_name, tool_obj in all_tools.items():
-            tool_tags = tool_obj.tags
-
-            if not should_include_tool_by_toolset(tool_tags, enabled_toolsets_filter):
-                logger.debug(
-                    f"Excluding tool '{registered_name}' (toolset not enabled)"
-                )
+        for tool_obj in all_tools:
+            registered_name = tool_obj.name
+            if not self._is_tool_enabled(registered_name, tool_obj, ctx):
+                logger.debug(f"Excluding tool '{registered_name}' (filtered)")
                 continue
-
-            if not should_include_tool(registered_name, enabled_tools_filter):
-                logger.debug(f"Excluding tool '{registered_name}' (not enabled)")
-                continue
-
-            if tool_obj and read_only and "write" in tool_tags:
-                logger.debug(
-                    f"Excluding tool '{registered_name}' due to read-only mode and 'write' tag"
-                )
-                continue
-
-            # Exclude Jira/Confluence tools if config is not fully authenticated
-            is_jira_tool = "jira" in tool_tags
-            is_confluence_tool = "confluence" in tool_tags
-            service_configured_and_available = True
-            if app_lifespan_state:
-                jira_available = (
-                    app_lifespan_state.full_jira_config is not None
-                ) or header_based_services.get("jira", False)
-                confluence_available = (
-                    app_lifespan_state.full_confluence_config is not None
-                ) or header_based_services.get("confluence", False)
-
-                if is_jira_tool and not jira_available:
-                    logger.debug(
-                        f"Excluding Jira tool '{registered_name}' as Jira configuration/authentication is incomplete and no header-based auth available."
-                    )
-                    service_configured_and_available = False
-                if is_confluence_tool and not confluence_available:
-                    logger.debug(
-                        f"Excluding Confluence tool '{registered_name}' as Confluence configuration/authentication is incomplete and no header-based auth available."
-                    )
-                    service_configured_and_available = False
-            elif is_jira_tool or is_confluence_tool:
-                jira_available = header_based_services.get("jira", False)
-                confluence_available = header_based_services.get("confluence", False)
-
-                if is_jira_tool and not jira_available:
-                    logger.debug(
-                        f"Excluding Jira tool '{registered_name}' as no Jira authentication available."
-                    )
-                    service_configured_and_available = False
-                if is_confluence_tool and not confluence_available:
-                    logger.debug(
-                        f"Excluding Confluence tool '{registered_name}' as no Confluence authentication available."
-                    )
-                    service_configured_and_available = False
-
-            if not service_configured_and_available:
-                continue
-
             mcp_tool = tool_obj.to_mcp_tool(name=registered_name)
             _sanitize_schema_for_compatibility(mcp_tool)
             filtered_tools.append(mcp_tool)
@@ -327,6 +384,24 @@ class AtlassianMCP(FastMCP[MainAppContext]):
             f"_list_tools_mcp: Total tools after filtering: {len(filtered_tools)}"
         )
         return filtered_tools
+
+    async def _call_tool_mcp(self, key: str, arguments: dict[str, Any]) -> Any:
+        # Enforce the same enablement filter at call time as at listing time, so a
+        # tool hidden from the listing (read-only mode, not in ENABLED_TOOLS, toolset
+        # disabled, or deployment-incompatible) cannot be invoked directly by name.
+        # Under an active filter context, denials and genuinely unknown tools raise
+        # byte-identical messages here (no exists-but-disabled leak), decoupled from
+        # upstream's error format (FastMCP uses a repr-quoted name).
+        ctx = self._tool_filter_context()
+        if ctx is not None:
+            tool_obj = await self.get_tool(key)
+            if (
+                tool_obj is None
+                or not self._is_tool_authorized(key, tool_obj, ctx)
+                or not self._is_tool_supported_on_deployment(tool_obj, ctx)
+            ):
+                raise NotFoundError(f"Unknown tool: {key}")
+        return await super()._call_tool_mcp(key, arguments)
 
     def http_app(
         self,
@@ -337,6 +412,9 @@ class AtlassianMCP(FastMCP[MainAppContext]):
         transport: Literal["http", "streamable-http", "sse"] = "streamable-http",
         event_store: EventStore | None = None,
         retry_interval: int | None = None,
+        host_origin_protection: bool | Literal["auto"] | None = None,
+        allowed_hosts: list[str] | None = None,
+        allowed_origins: list[str] | None = None,
     ) -> StarletteWithLifespan:
         final_path = path
         if transport == "streamable-http":
@@ -356,13 +434,11 @@ class AtlassianMCP(FastMCP[MainAppContext]):
             transport=transport,
             event_store=event_store,
             retry_interval=retry_interval,
+            host_origin_protection=host_origin_protection,
+            allowed_hosts=allowed_hosts,
+            allowed_origins=allowed_origins,
         )
         return app
-
-
-token_validation_cache: MutableMapping[
-    int, tuple[bool, str | None, JiraFetcher | None, ConfluenceFetcher | None]
-] = TTLCache(maxsize=100, ttl=300)
 
 
 class UserTokenMiddleware:
@@ -440,6 +516,29 @@ class UserTokenMiddleware:
         if auth_error:
             logger.warning(f"Authentication failed: {auth_error}")
             await self._send_json_error_response(safe_send, 401, auth_error)
+            return  # Don't call self.app - request is rejected
+
+        # Without an OAuth provider, reject unauthenticated MCP requests at the
+        # transport boundary so the downstream handler cannot fall back to the
+        # operator's global credentials. When a provider is attached, defer to
+        # FastMCP so it can return the RFC 9728 OAuth discovery challenge.
+        if (
+            not ignore_header_auth
+            and self.mcp_server_ref
+            and self._should_process_auth(scope_copy)
+            and not scope_copy["state"].get("user_atlassian_auth_type")
+            and self.mcp_server_ref.auth is None
+            and not is_env_truthy("ALLOW_GLOBAL_CRED_FALLBACK")
+        ):
+            logger.warning(
+                "UserTokenMiddleware: rejecting unauthenticated MCP request "
+                "(no user identity and ALLOW_GLOBAL_CRED_FALLBACK is off)"
+            )
+            await self._send_json_error_response(
+                safe_send,
+                401,
+                "Authentication required: no Atlassian credentials were provided.",
+            )
             return  # Don't call self.app - request is rejected
 
         # Call the next application with modified scope and safe send wrapper
@@ -667,7 +766,12 @@ class UserTokenMiddleware:
         elif auth_header.strip():
             # Non-empty but unsupported auth type
             auth_value = auth_header.strip()
-            auth_type = auth_value.split(" ", 1)[0] if " " in auth_value else auth_value
+            if " " in auth_value:
+                auth_type = auth_value.split(" ", 1)[0]
+            else:
+                # No space means no type prefix — likely a raw token.
+                # Redact to avoid leaking credentials in logs.
+                auth_type = "<redacted>"
             logger.warning(f"Unsupported Authorization type: {auth_type}")
             scope["state"]["auth_validation_error"] = (
                 "Unauthorized: Only 'Bearer <OAuthToken>', "
@@ -815,8 +919,8 @@ main_mcp = AtlassianMCP(
     lifespan=main_lifespan,
     auth=_build_auth_provider(),
 )
-main_mcp.mount(jira_mcp, "jira")
-main_mcp.mount(confluence_mcp, "confluence")
+main_mcp.mount(jira_mcp, namespace="jira")
+main_mcp.mount(confluence_mcp, namespace="confluence")
 
 
 @main_mcp.custom_route("/healthz", methods=["GET"], include_in_schema=False)

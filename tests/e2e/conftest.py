@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import base64
 import logging
+import os
 import uuid
 from collections.abc import Generator
 from dataclasses import dataclass
@@ -23,6 +24,7 @@ from mcp_atlassian.jira.config import JiraConfig
 from mcp_atlassian.utils.oauth import BYOAccessTokenOAuthConfig
 
 logger = logging.getLogger(__name__)
+
 
 # Default DC instance settings
 DEFAULT_JIRA_URL = "http://localhost:8080"
@@ -240,8 +242,8 @@ def _create_jira_pat(info: DCInstanceInfo) -> Any:
 def _create_confluence_pat(info: DCInstanceInfo) -> Any:
     """Create a Confluence PAT via REST API."""
     resp = requests.post(
-        (f"{info.confluence_url}/rest/de.resolution.apitokenauth/1.0/user/token"),
-        json={"tokenName": "e2e-pytest"},
+        f"{info.confluence_url}/rest/pat/latest/tokens",
+        json={"name": "e2e-pytest", "expirationDuration": 90},
         auth=(info.admin_username, info.admin_password),
         timeout=30,
     )
@@ -439,13 +441,25 @@ def _make_confluence_byo_oauth_config(
 
 
 @pytest.fixture(scope="session")
-def dc_instance() -> DCInstanceInfo:
+def dc_instance(request: pytest.FixtureRequest) -> DCInstanceInfo:
     """Session-scoped fixture providing DC instance connection info.
 
     Discovers test data and creates PATs at session start.
     Skips entire session if instances are unreachable.
     """
     info = DCInstanceInfo()
+
+    # Mirror a real deployment: the operator sets JIRA_URL/CONFLUENCE_URL in the
+    # environment, which the SSRF pinning adapter trusts — without this, the
+    # localhost DC instances are (correctly) rejected as non-global addresses.
+    environment = pytest.MonkeyPatch()
+    request.addfinalizer(environment.undo)
+    for name, value in (
+        ("JIRA_URL", info.jira_url),
+        ("CONFLUENCE_URL", info.confluence_url),
+    ):
+        if name not in os.environ:
+            environment.setenv(name, value)
 
     if not _check_dc_health(info.jira_url):
         pytest.skip(f"Jira DC not reachable at {info.jira_url}")
@@ -562,6 +576,53 @@ def resource_tracker(
         jira_client=jira_fetcher,
         confluence_client=confluence_fetcher,
     )
+
+
+@pytest.fixture(scope="session")
+def jsm_dc_instance(request: pytest.FixtureRequest) -> DCInstanceInfo:
+    """Session-scoped info for the dedicated Jira Service Management DC instance.
+
+    JSM ships as a separate application, so it runs as its own instance rather
+    than on the Jira Software DC box used by the rest of the DC suite.
+    """
+    jsm_url = os.environ.get("DC_E2E_JSM_URL", "").strip()
+    if not jsm_url:
+        pytest.skip("DC JSM e2e requires DC_E2E_JSM_URL")
+
+    info = DCInstanceInfo(
+        jira_url=jsm_url,
+        admin_username=os.environ.get("DC_E2E_JSM_USERNAME", DEFAULT_ADMIN_USER),
+        admin_password=os.environ.get("DC_E2E_JSM_PASSWORD", DEFAULT_ADMIN_PASS),
+    )
+
+    # Same reason as dc_instance: the SSRF pinning adapter only trusts hosts
+    # named in the environment.
+    environment = pytest.MonkeyPatch()
+    request.addfinalizer(environment.undo)
+    if "JIRA_URL" not in os.environ:
+        environment.setenv("JIRA_URL", info.jira_url)
+
+    if not _check_dc_health(info.jira_url):
+        pytest.skip(f"Jira Service Management DC not reachable at {info.jira_url}")
+
+    return info
+
+
+@pytest.fixture(scope="session")
+def jsm_jira_fetcher(jsm_dc_instance: DCInstanceInfo) -> JiraFetcher:
+    """Session-scoped Jira fetcher for the JSM DC instance (basic auth)."""
+    config = _make_jira_basic_config(jsm_dc_instance)
+    return JiraFetcher(config=config)
+
+
+@pytest.fixture
+def jsm_resource_tracker(
+    jsm_jira_fetcher: JiraFetcher,
+) -> Generator[DCResourceTracker, None, None]:
+    """Resource tracker that cleans up against the JSM instance, not :8080."""
+    tracker = DCResourceTracker()
+    yield tracker
+    tracker.cleanup(jira_client=jsm_jira_fetcher)
 
 
 @pytest.fixture(scope="module")
