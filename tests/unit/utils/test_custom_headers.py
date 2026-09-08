@@ -1,5 +1,9 @@
 """Tests for custom headers parsing functionality."""
 
+import logging
+
+import pytest
+
 from mcp_atlassian.utils.env import get_custom_headers, get_header_names
 
 
@@ -222,3 +226,36 @@ class TestParseHeaderNames:
             "X-SSO-User",
             "X-Trace",
         ]
+
+    def test_http_token_punctuation_is_allowed(self, monkeypatch):
+        """RFC HTTP tokens allow more punctuation than identifier names."""
+        token = "!#$%&'*+-.^_`|~0123456789AZaz"
+        monkeypatch.setenv("TEST_HEADER_NAMES", f" \t{token}\t, X-Trace, x-trace")
+        assert get_header_names("TEST_HEADER_NAMES") == [token, "X-Trace"]
+
+    @pytest.mark.parametrize(
+        "invalid",
+        [
+            "X Bad",
+            "X\tBad",
+            "Authorization: secret",
+            "X=secret",
+            "X/Bad",
+            "X-Bad\r\n",
+            "\nX-Bad",
+            "X-\x01Bad",
+            "X-\x7fBad",
+            "X-Café",
+        ],
+    )
+    def test_invalid_header_names_are_ignored_without_leaking_input(
+        self, invalid, monkeypatch, caplog
+    ):
+        """Invalid configuration is warned about without logging credential text."""
+        monkeypatch.setenv("TEST_HEADER_NAMES", f"X-Good,{invalid},X-Other")
+        with caplog.at_level(logging.WARNING):
+            assert get_header_names("TEST_HEADER_NAMES") == ["X-Good", "X-Other"]
+        assert len(caplog.records) == 1
+        assert "TEST_HEADER_NAMES" in caplog.text
+        assert invalid not in caplog.text
+        assert "secret" not in caplog.text

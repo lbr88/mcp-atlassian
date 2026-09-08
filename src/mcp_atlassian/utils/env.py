@@ -2,12 +2,15 @@
 
 import logging
 import os
+import re
 from typing import Annotated
 
 from pydantic import Field, TypeAdapter
 from pydantic_core import SchemaError
 
 logger = logging.getLogger("mcp-atlassian.env")
+
+_HTTP_TOKEN_RE = re.compile(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+")
 
 
 def is_env_truthy(env_var_name: str, default: str = "") -> bool:
@@ -185,6 +188,9 @@ def get_custom_headers(env_var_name: str) -> dict[str, str]:
 def get_header_names(env_var_name: str) -> list[str]:
     """Parse comma-separated HTTP header names from an environment variable.
 
+    Surrounding spaces/tabs separate entries. Invalid HTTP tokens are ignored
+    with a warning that never includes the configured entry or header values.
+
     Args:
         env_var_name: Name of the environment variable to read.
 
@@ -198,8 +204,11 @@ def get_header_names(env_var_name: str) -> list[str]:
     header_names: list[str] = []
     seen_names: set[str] = set()
     for raw_name in header_string.split(","):
-        header_name = raw_name.strip()
+        header_name = raw_name.strip(" \t")
         if not header_name:
+            continue
+        if _HTTP_TOKEN_RE.fullmatch(header_name) is None:
+            logger.warning("Ignoring invalid HTTP header name in %s", env_var_name)
             continue
 
         normalized_name = header_name.lower()

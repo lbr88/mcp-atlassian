@@ -65,7 +65,10 @@ def test_pinning_adapter_blocks_internal_through_real_stack(ip):
 
 @pytest.mark.security_regression
 @pytest.mark.parametrize("service", ["jira", "confluence"])
-def test_request_configured_client_blocks_proxy_dns_bypass(service, monkeypatch):
+@pytest.mark.parametrize("credential_clone", [False, True])
+def test_request_configured_client_blocks_proxy_dns_bypass(
+    service, credential_clone, monkeypatch
+):
     """A request-derived service URL cannot delegate its DNS checks to a proxy."""
     from importlib import import_module
     from unittest.mock import MagicMock
@@ -83,10 +86,17 @@ def test_request_configured_client_blocks_proxy_dns_bypass(service, monkeypatch)
     monkeypatch.setattr(module, prefix, lambda **kwargs: api)
     config = config_type(
         url="https://rebind.attacker.test",
+        url_source="request",
         auth_type="pat",
         personal_token="test-token",
         https_proxy="http://proxy.example.test:8080",
     )
+    if credential_clone:
+        from mcp_atlassian.servers.dependencies import _create_user_config_for_fetcher
+
+        config = _create_user_config_for_fetcher(
+            config, "pat", {"personal_access_token": "per-user-token"}
+        )
     client = getattr(module, f"{prefix}Client")(config=config)
     session = getattr(client, service)._session
 
@@ -275,3 +285,100 @@ def test_global_address_connects_to_the_validated_ip():
         _pinned_create_connection(("example.com", 443))
 
     assert connected["addr"][0] == "93.184.216.34"
+
+
+@pytest.fixture
+def private_dc_server():
+    """Serve only loopback HTTP to exercise real clients without external access."""
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from urllib.parse import urlsplit
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802
+            if urlsplit(self.path).path == "/start":
+                self.send_response(302)
+                self.send_header("Location", "/ok")
+                self.end_headers()
+            elif urlsplit(self.path).path == "/escape":
+                self.send_response(302)
+                self.send_header("Location", "http://169.254.169.254/latest/meta-data")
+                self.end_headers()
+            else:
+                self.send_response(200)
+                self.send_header("Content-Length", "10")
+                self.end_headers()
+                self.wfile.write(b"private DC")
+
+        def log_message(self, format, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_port}"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+@pytest.mark.parametrize("service", ["jira", "confluence"])
+@pytest.mark.parametrize("ssl_verify", [True, False])
+@pytest.mark.parametrize("use_proxy", [False, True])
+def test_programmatic_private_client_connects_and_guards_redirects(
+    service, ssl_verify, use_proxy, private_dc_server, monkeypatch
+):
+    """Explicit library configs reach private DC without granting other clients trust."""
+    from importlib import import_module
+    from unittest.mock import MagicMock
+
+    for key in ("JIRA_URL", "CONFLUENCE_URL", "MCP_ALLOWED_URL_DOMAINS"):
+        monkeypatch.delenv(key, raising=False)
+    module = import_module(f"mcp_atlassian.{service}.client")
+    prefix = "Jira" if service == "jira" else "Confluence"
+    config_type = getattr(
+        import_module(f"mcp_atlassian.{service}.config"), f"{prefix}Config"
+    )
+    api = MagicMock()
+    api._session = requests.Session()
+    api.default_headers = {}
+    monkeypatch.setattr(module, prefix, lambda **kwargs: api)
+    config = config_type(
+        url="http://dc.private.example" if use_proxy else private_dc_server,
+        auth_type="pat",
+        personal_token="test-token",
+        ssl_verify=ssl_verify,
+        http_proxy=private_dc_server if use_proxy else None,
+        no_proxy="127.0.0.1",
+    )
+    client = getattr(module, f"{prefix}Client")(config=config)
+    with getattr(client, service)._session as session:
+        response = session.get(config.url + "/start", timeout=2)
+        assert response.text == "private DC"
+        assert response.url == config.url + "/ok"
+        with pytest.raises(ValueError, match="SSRF"):
+            session.get(config.url + "/escape", timeout=2)
+
+    # Trust is session-local, not a process-wide allowlist for later callers.
+    with requests.Session() as untrusted:
+        untrusted.trust_env = False
+        mount_ssrf_pinning(untrusted)
+        with pytest.raises(requests.ConnectionError, match="SSRF blocked"):
+            untrusted.get(private_dc_server, timeout=2)
+
+
+@pytest.mark.security_regression
+def test_explicit_programmatic_host_trust_is_exact(monkeypatch):
+    """A trusted URL does not implicitly trust arbitrary subdomains."""
+    for key in ("JIRA_URL", "CONFLUENCE_URL", "MCP_ALLOWED_URL_DOMAINS"):
+        monkeypatch.delenv(key, raising=False)
+    session = requests.Session()
+    session.trust_env = False
+    mount_ssrf_pinning(session, "https://dc.example.test")
+    with (
+        patch("socket.getaddrinfo", side_effect=_gai_returning("169.254.169.254")),
+        pytest.raises(requests.ConnectionError, match="SSRF blocked"),
+    ):
+        session.get("https://attacker.dc.example.test", timeout=1)

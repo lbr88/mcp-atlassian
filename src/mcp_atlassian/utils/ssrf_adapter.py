@@ -11,12 +11,11 @@ exactly once, rejects any candidate address that is not globally routable
 address — there is no separate re-resolution to rebind. The original hostname is
 preserved for TLS SNI and certificate verification, so HTTPS is unaffected.
 
-Operator-trusted hosts — the configured ``JIRA_URL`` / ``CONFLUENCE_URL`` hosts
-and ``MCP_ALLOWED_URL_DOMAINS`` entries — are exempt from the non-global
+Operator-trusted hosts — configured service hosts, explicit programmatic config
+URLs, and ``MCP_ALLOWED_URL_DOMAINS`` entries — are exempt from the non-global
 rejection (on-prem DC instances legitimately live on private networks or
-localhost). Those values come from the server environment, which an attacker
-cannot influence through a request, so the rebinding guard is not weakened for
-caller-supplied URLs. The single-resolution pin still applies to every host.
+localhost). Programmatic trust stays local to each adapter and must never include
+request-derived URLs. The single-resolution pin still applies to every host.
 """
 
 import os
@@ -53,6 +52,7 @@ def _pinned_create_connection(
     timeout: Any = socket._GLOBAL_DEFAULT_TIMEOUT,  # type: ignore[attr-defined]  # noqa: SLF001
     source_address: tuple[str, int] | None = None,
     socket_options: Any = None,
+    trusted_hosts: set[str] | None = None,
 ) -> socket.socket:
     """Resolve once, reject non-global addresses, connect to the validated IP.
 
@@ -61,7 +61,9 @@ def _pinned_create_connection(
     connection.
     """
     host, port = address
-    host_trusted = _hostname_matches_allowlist(host, _operator_trusted_hosts())
+    host_trusted = (
+        trusted_hosts is not None and host.lower() in trusted_hosts
+    ) or _hostname_matches_allowlist(host, _operator_trusted_hosts())
     err: Exception | None = None
     for af, socktype, proto, _canonname, sa in socket.getaddrinfo(
         host, port, 0, socket.SOCK_STREAM
@@ -95,6 +97,12 @@ def _pinned_create_connection(
 class _PinnedConnMixin:
     """Route socket creation through the validating, single-resolution connector."""
 
+    def __init__(
+        self, *args: Any, trusted_hosts: set[str] | None = None, **kwargs: Any
+    ) -> None:
+        self._trusted_hosts = trusted_hosts
+        super().__init__(*args, **kwargs)
+
     def _new_conn(self) -> socket.socket:
         try:
             return _pinned_create_connection(
@@ -102,6 +110,7 @@ class _PinnedConnMixin:
                 self.timeout,  # type: ignore[attr-defined]
                 source_address=self.source_address,  # type: ignore[attr-defined]
                 socket_options=self.socket_options,  # type: ignore[attr-defined]
+                trusted_hosts=self._trusted_hosts,
             )
         except OSError as e:
             raise NewConnectionError(
@@ -124,6 +133,29 @@ class _PinnedHTTPConnectionPool(HTTPConnectionPool):
 
 class _PinnedHTTPSConnectionPool(HTTPSConnectionPool):
     ConnectionCls = _PinnedHTTPSConnection
+
+
+class _PinnedPoolManager(PoolManager):
+    """Keep operator trust local to this manager's connection pools."""
+
+    def __init__(self, *args: Any, trusted_hosts: set[str], **kwargs: Any) -> None:
+        self._trusted_hosts = trusted_hosts
+        super().__init__(*args, **kwargs)
+        self.pool_classes_by_scheme = {
+            "http": _PinnedHTTPConnectionPool,
+            "https": _PinnedHTTPSConnectionPool,
+        }
+
+    def _new_pool(
+        self,
+        scheme: str,
+        host: str,
+        port: int,
+        request_context: dict[str, Any] | None = None,
+    ) -> HTTPConnectionPool:
+        pool = super()._new_pool(scheme, host, port, request_context)
+        pool.conn_kw["trusted_hosts"] = self._trusted_hosts
+        return pool
 
 
 class SsrfPinningAdapter(HTTPAdapter):
@@ -160,8 +192,10 @@ class SsrfPinningAdapter(HTTPAdapter):
         adapter's validating pool.
         """
         hostname = urlparse(request.url or "").hostname or ""
-        if proxies and not _hostname_matches_allowlist(
-            hostname, [*_operator_trusted_hosts(), *self._trusted_hosts]
+        if (
+            proxies
+            and hostname.lower() not in self._trusted_hosts
+            and not _hostname_matches_allowlist(hostname, _operator_trusted_hosts())
         ):
             proxies = {}
         return super().send(
@@ -176,14 +210,13 @@ class SsrfPinningAdapter(HTTPAdapter):
     def init_poolmanager(
         self, connections: int, maxsize: int, block: bool = False, **pool_kwargs: Any
     ) -> None:
-        self.poolmanager = PoolManager(
-            num_pools=connections, maxsize=maxsize, block=block, **pool_kwargs
+        self.poolmanager = _PinnedPoolManager(
+            num_pools=connections,
+            maxsize=maxsize,
+            block=block,
+            trusted_hosts=self._trusted_hosts,
+            **pool_kwargs,
         )
-        # Runtime attribute of urllib3's PoolManager; absent from the type stubs.
-        self.poolmanager.pool_classes_by_scheme = {  # type: ignore[attr-defined]
-            "http": _PinnedHTTPConnectionPool,
-            "https": _PinnedHTTPSConnectionPool,
-        }
 
 
 def mount_ssrf_pinning(session: Session, *trusted_urls: str) -> None:
@@ -194,7 +227,7 @@ def mount_ssrf_pinning(session: Session, *trusted_urls: str) -> None:
 
     Args:
         session: Requests session to protect.
-        trusted_urls: Operator-controlled transport URLs that may use proxies.
+        trusted_urls: Operator-controlled transport URLs allowed private IPs/proxies.
     """
     for scheme in ("https://", "http://"):
         existing = session.adapters.get(scheme)

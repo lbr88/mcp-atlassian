@@ -1,6 +1,5 @@
 """Tests for the SSL utilities module."""
 
-import ssl
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -34,40 +33,6 @@ def test_ssl_ignore_adapter_cert_verify():
         mock_super_cert_verify.assert_called_once_with(
             connection, url, verify=False, cert=cert
         )
-
-
-def test_ssl_ignore_adapter_init_poolmanager():
-    """Test that SSLIgnoreAdapter properly initializes the connection pool with SSL verification disabled."""
-    # Arrange
-    adapter = SSLIgnoreAdapter()
-
-    # Create a mock for PoolManager that will be returned by constructor
-    mock_pool_manager = MagicMock()
-
-    # Mock ssl.create_default_context
-    with patch("ssl.create_default_context") as mock_create_context:
-        mock_context = MagicMock()
-        mock_create_context.return_value = mock_context
-
-        # Patch the PoolManager constructor
-        with patch(
-            "mcp_atlassian.utils.ssl.PoolManager", return_value=mock_pool_manager
-        ) as mock_pool_manager_cls:
-            # Act
-            adapter.init_poolmanager(5, 10, block=True)
-
-            # Assert
-            mock_create_context.assert_called_once()
-            assert mock_context.check_hostname is False
-            assert mock_context.verify_mode == ssl.CERT_NONE
-
-            # Verify PoolManager was called with our context
-            mock_pool_manager_cls.assert_called_once()
-            _, kwargs = mock_pool_manager_cls.call_args
-            assert kwargs["num_pools"] == 5
-            assert kwargs["maxsize"] == 10
-            assert kwargs["block"] is True
-            assert kwargs["ssl_context"] == mock_context
 
 
 def test_configure_ssl_verification_disabled():

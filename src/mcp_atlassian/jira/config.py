@@ -192,6 +192,10 @@ class JiraConfig:
     # internal-only (non-customer-visible) comments. See
     # JIRA_INTERNAL_ONLY_PROJECTS. Empty by default (guard disabled).
 
+    # Direct construction/from_env is operator input. Factories replacing the URL
+    # with caller input MUST mark it "request"; credential-only clones preserve it.
+    url_source: Literal["operator", "request"] = "operator"
+
     @property
     def is_cloud(self) -> bool:
         """Check if this is a cloud instance.

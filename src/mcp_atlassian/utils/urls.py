@@ -27,11 +27,13 @@ def _url_origin(url: str) -> tuple[str, str, int] | None:
         return None
 
 
-def make_ssrf_redirect_hook() -> Callable[..., Any]:
+def make_ssrf_redirect_hook(*trusted_urls: str) -> Callable[..., Any]:
     """Return a requests ``response`` hook that blocks SSRF-unsafe redirects.
 
     Attach to any session (``session.hooks["response"].append(...)``) so that an
     open redirect cannot steer an outbound request to an internal/metadata host.
+    Operator-selected URLs additionally permit redirects within their exact
+    origin, including private Data Center hosts. Never pass request-derived URLs.
     """
 
     def hook(response: Any, **kwargs: Any) -> Any:
@@ -42,8 +44,12 @@ def make_ssrf_redirect_hook() -> Callable[..., Any]:
                 origin is not None
                 and _url_origin(redirect_url) == origin
                 and any(
-                    _url_origin(os.getenv(name, "")) == origin
-                    for name in ("JIRA_URL", "CONFLUENCE_URL")
+                    _url_origin(url) == origin
+                    for url in (
+                        *trusted_urls,
+                        os.getenv("JIRA_URL", ""),
+                        os.getenv("CONFLUENCE_URL", ""),
+                    )
                 )
             ):
                 return response
