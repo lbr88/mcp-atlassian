@@ -24,6 +24,66 @@ class TestConfluenceV2Adapter:
             session=mock_session, base_url="https://example.atlassian.net/wiki"
         )
 
+    def test_move_to_root_without_visible_target_does_not_mutate(
+        self, v2_adapter, mock_session
+    ):
+        space_response = Mock()
+        space_response.json.return_value = {"results": [{"id": "900"}]}
+        roots_response = Mock()
+        roots_response.json.return_value = {"results": []}
+        mock_session.get.side_effect = [space_response, roots_response]
+
+        with pytest.raises(ValueError):
+            v2_adapter.move_page("111", target_space_key="DEST")
+
+        mock_session.put.assert_not_called()
+        mock_session.post.assert_not_called()
+
+    def test_move_to_existing_root_is_already_at_destination(
+        self, v2_adapter, mock_session
+    ):
+        space_response = Mock()
+        space_response.json.return_value = {"results": [{"id": "900"}]}
+        roots_response = Mock()
+        roots_response.json.return_value = {"results": [{"id": "111"}]}
+        mock_session.get.side_effect = [space_response, roots_response]
+
+        v2_adapter.move_page("111", target_space_key="DEST")
+
+        # Moving a page relative to itself is invalid; this is a true no-op.
+        mock_session.put.assert_not_called()
+
+    @pytest.mark.parametrize("status_code", [401, 403])
+    @pytest.mark.parametrize("failure_stage", ["space", "root"])
+    def test_move_to_root_preserves_auth_failure(
+        self, v2_adapter, mock_session, status_code, failure_stage
+    ):
+        failed_response = Mock(status_code=status_code)
+        error = HTTPError(response=failed_response)
+        failed_response.raise_for_status.side_effect = error
+        space_response = Mock()
+        space_response.json.return_value = {"results": [{"id": "900"}]}
+        mock_session.get.side_effect = (
+            [failed_response]
+            if failure_stage == "space"
+            else [space_response, failed_response]
+        )
+
+        with pytest.raises(HTTPError) as raised:
+            v2_adapter.move_page("111", target_space_key="DEST")
+
+        assert raised.value is error
+        mock_session.put.assert_not_called()
+
+    def test_move_without_target_does_not_call_incomplete_endpoint(
+        self, v2_adapter, mock_session
+    ):
+        with pytest.raises(ValueError):
+            v2_adapter.move_page("111")
+
+        mock_session.put.assert_not_called()
+        mock_session.get.assert_not_called()
+
     def test_get_page_success(self, v2_adapter, mock_session):
         """Test successful page retrieval."""
         # Mock the v2 API response

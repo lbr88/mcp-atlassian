@@ -70,6 +70,8 @@ class ConfluenceV2Adapter:
 
         except Exception as e:
             if isinstance(e, HTTPError) and e.response is not None:
+                if e.response.status_code in [401, 403]:
+                    raise
                 logger.error(
                     f"HTTP error getting space ID for '{space_key}': {e}\n"
                     f"Response: {e.response.text}"
@@ -962,11 +964,17 @@ class ConfluenceV2Adapter:
         page_id: str,
         position: str = "append",
         target_id: str | None = None,
+        *,
+        target_space_key: str | None = None,
     ) -> None:
         """Move a page using the v1 REST API.
 
         Uses PUT /wiki/rest/api/content/{id}/move/{position}/{targetId}
         which works with OAuth authentication (unlike movepage.action).
+        For a space-only move, resolve a current root page in that space and
+        move beside it, not beneath the space homepage. This leaves the page's
+        title, body, and version untouched. A space without a visible current
+        root page cannot be targeted by this API; fail without moving anything.
 
         Args:
             page_id: The ID of the page to move.
@@ -976,20 +984,41 @@ class ConfluenceV2Adapter:
                 - "after": Move after target as sibling.
             target_id: Target page ID. Required for "append", "before",
                 and "after" positions.
+                Alternatively, provide target_space_key for a space-root move.
+            target_space_key: Destination space key when target_id is omitted.
 
         Raises:
             ValueError: If move fails.
             HTTPError: If the API request fails (propagates 401/403).
         """
         try:
-            if target_id:
-                url = (
-                    f"{self.base_url}/rest/api/content/{page_id}"
-                    f"/move/{position}/{target_id}"
+            if not target_id:
+                if not target_space_key:
+                    raise ValueError("A target page or target space is required")
+                space_id = self._get_space_id(target_space_key)
+                response = self.session.get(
+                    f"{self.base_url}/api/v2/spaces/{space_id}/pages",
+                    params={"depth": "root", "status": "current", "limit": 1},
                 )
-            else:
-                # Move to space root (no target ID)
-                url = f"{self.base_url}/rest/api/content/{page_id}/move/{position}"
+                response.raise_for_status()
+                roots = response.json().get("results", [])
+                if not roots or not roots[0].get("id"):
+                    raise ValueError(
+                        f"Space '{target_space_key}' has no visible current root page; "
+                        "the move API requires a target page. Provide a target "
+                        "parent page or make a root page visible in that space."
+                    )
+                target_id = str(roots[0]["id"])
+                if target_id == str(page_id):
+                    return  # The page is already at the requested space root.
+                # The v1 move API documents before/after a top-level page as
+                # a true root move; append would incorrectly make it a child.
+                position = "after"
+
+            url = (
+                f"{self.base_url}/rest/api/content/{page_id}"
+                f"/move/{position}/{target_id}"
+            )
 
             response = self.session.put(url)
             response.raise_for_status()

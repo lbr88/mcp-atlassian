@@ -60,6 +60,10 @@ class ConfluenceConfig:
     #   False -> always the legacy link
     attachment_download_use_v1: bool | None = None
 
+    # Direct construction/from_env is operator input. Factories replacing the URL
+    # with caller input MUST mark it "request"; credential-only clones preserve it.
+    url_source: Literal["operator", "request"] = "operator"
+
     @property
     def is_cloud(self) -> bool:
         """Check if this is a cloud instance.

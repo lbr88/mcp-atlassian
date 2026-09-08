@@ -268,16 +268,15 @@ class TestConfluenceClientExternalAuth:
 
 
 class TestGetAvailableServicesExternalAuth:
-    def test_both_services_available_with_only_flag(self):
-        """Both services are available when ATLASSIAN_EXTERNAL_AUTH_ENABLE=true."""
+    def test_services_unavailable_with_only_flag(self):
+        """External auth still requires each service's configured URL."""
         with patch.dict(
             os.environ,
             {"ATLASSIAN_EXTERNAL_AUTH_ENABLE": "true"},
             clear=True,
         ):
             result = get_available_services()
-            assert result["jira"] is True
-            assert result["confluence"] is True
+            assert result == {"jira": False, "confluence": False}
 
     def test_flag_with_urls_marks_services_available(self):
         """Services with URLs and external-auth flag are reported as available."""
@@ -300,6 +299,22 @@ class TestGetAvailableServicesExternalAuth:
             result = get_available_services()
             assert result["jira"] is False
             assert result["confluence"] is False
+
+    @pytest.mark.parametrize("service", ["jira", "confluence"])
+    def test_only_service_with_url_is_available(self, service):
+        """A global auth-mode flag must not enable the unconfigured service."""
+        with patch.dict(
+            os.environ,
+            {
+                "ATLASSIAN_EXTERNAL_AUTH_ENABLE": "true",
+                f"{service.upper()}_URL": f"https://{service}.example.com",
+            },
+            clear=True,
+        ):
+            assert get_available_services() == {
+                "jira": service == "jira",
+                "confluence": service == "confluence",
+            }
 
 
 # ---------------------------------------------------------------------------

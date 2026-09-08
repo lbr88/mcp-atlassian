@@ -1491,6 +1491,8 @@ class PagesMixin(ConfluenceClient):
             page_id: ID of the page to move.
             target_parent_id: Target parent page ID. If omitted with
                 target_space_key, moves page to root of target space.
+                Cloud OAuth requires a visible current root page in that space
+                to use as a sibling target; an empty result fails without a move.
             target_space_key: Target space key for cross-space moves.
             position: Position relative to target ("append", "above",
                 or "below").
@@ -1517,8 +1519,11 @@ class PagesMixin(ConfluenceClient):
                 )
                 v2_adapter.move_page(
                     page_id=page_id,
-                    position=position,
+                    position={"above": "before", "below": "after"}.get(
+                        position, position
+                    ),
                     target_id=target_parent_id,
+                    target_space_key=target_space_key,
                 )
             else:
                 # Determine space_key for the move_page call
