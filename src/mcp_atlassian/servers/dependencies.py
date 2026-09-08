@@ -57,7 +57,6 @@ class _ServiceSpec:
     token_header: str  # X-Atlassian-{Service}-Personal-Token
     passthrough_env_var: str  # {SERVICE}_PASSTHROUGH_HEADERS
     filter_kwargs: dict[str, Any]  # e.g. {"projects_filter": None}
-    get_session: Callable[[Any], Any]  # fetcher → session
     validate_fn: Callable[[Any], Any]  # fetcher → validation data
     on_validated: Callable[
         [str, Request, Any, str, str | None], None
@@ -324,7 +323,6 @@ def _jira_spec() -> _ServiceSpec:
         token_header="X-Atlassian-Jira-Personal-Token",  # noqa: S106
         passthrough_env_var="JIRA_PASSTHROUGH_HEADERS",
         filter_kwargs={"projects_filter": None},
-        get_session=lambda f: f.jira._session,
         validate_fn=lambda f: f.get_current_user_account_id(),
         on_validated=_jira_on_validated,
     )
@@ -346,7 +344,6 @@ def _confluence_spec() -> _ServiceSpec:
         token_header="X-Atlassian-Confluence-Personal-Token",  # noqa: S106
         passthrough_env_var="CONFLUENCE_PASSTHROUGH_HEADERS",
         filter_kwargs={"spaces_filter": None},
-        get_session=lambda f: f.confluence._session,
         validate_fn=lambda f: f.get_current_user_info(),
         on_validated=_confluence_on_validated,
     )
@@ -482,8 +479,6 @@ def _create_and_validate(
     config: Any,
     auth_branch: str,
     user_email: str | None = None,
-    *,
-    attach_ssrf_hook: bool = False,
 ) -> Any:
     """Create a fetcher, validate credentials, cache on request.state.
 
@@ -497,7 +492,6 @@ def _create_and_validate(
         config: Service-specific config instance.
         auth_branch: One of "header_pat", "basic", "oauth_pat".
         user_email: User email from request state (for logging).
-        attach_ssrf_hook: Whether to attach SSRF redirect hook.
 
     Returns:
         Validated fetcher instance.
@@ -530,11 +524,6 @@ def _create_and_validate(
             else None
         )
         fetcher = spec.fetcher_class(config=config)
-        if attach_ssrf_hook:
-            session = spec.get_session(fetcher)
-            session.hooks["response"].append(
-                _make_ssrf_safe_hook(validate_url_for_ssrf)
-            )
         validation_cache = _validation_cache
         if cache_key is not None and validation_cache is not None:
             validation_data = _validate_with_cache(
@@ -584,34 +573,6 @@ def _resolve_oauth_access_token(fallback_token: str, service: str) -> str:
         return access_token.token
 
     return fallback_token
-
-
-def _make_ssrf_safe_hook(
-    validate_fn: Callable[[str], str | None],
-) -> Callable[..., Any]:
-    """Create a requests response hook that validates redirect URLs.
-
-    Blocks HTTP redirects that target internal/private IP addresses
-    to prevent SSRF via open-redirect chains.
-
-    Args:
-        validate_fn: A function that returns None if safe,
-            error string if blocked.
-
-    Returns:
-        A requests response hook function.
-    """
-
-    def hook(response: Any, **kwargs: Any) -> Any:
-        if response.is_redirect:
-            redirect_url = response.headers.get("Location", "")
-            error = validate_fn(redirect_url)
-            if error:
-                response.close()
-                raise ValueError(f"Redirect blocked (SSRF): {error}")
-        return response
-
-    return hook
 
 
 def _resolve_bearer_auth_type(
@@ -864,6 +825,7 @@ async def _get_fetcher(ctx: Context, spec: _ServiceSpec) -> Any:
             )
             header_config = spec.config_class(
                 url=url_header_val,
+                url_source="request",
                 auth_type="pat",
                 personal_token=token_header_val,
                 **_get_header_pat_network_config(ctx, spec),
@@ -878,7 +840,6 @@ async def _get_fetcher(ctx: Context, spec: _ServiceSpec) -> Any:
                 spec,
                 header_config,
                 "header_pat",
-                attach_ssrf_hook=True,
             )
 
         # --- Branch 2: basic auth ---
@@ -910,7 +871,6 @@ async def _get_fetcher(ctx: Context, spec: _ServiceSpec) -> Any:
                 user_config,
                 "basic",
                 user_email=user_email,
-                attach_ssrf_hook=True,
             )
 
         # --- Branch 3: OAuth / PAT with token ---
@@ -960,7 +920,6 @@ async def _get_fetcher(ctx: Context, spec: _ServiceSpec) -> Any:
                 user_config,
                 "oauth_pat",
                 user_email=user_email,
-                attach_ssrf_hook=True,
             )
 
         else:
@@ -1029,7 +988,9 @@ async def _get_fetcher(ctx: Context, spec: _ServiceSpec) -> Any:
                         f"from {spec.url_header} header: {url_from_header}"
                     )
                     global_config_fallback = dataclasses.replace(
-                        global_config_fallback, url=url_from_header
+                        global_config_fallback,
+                        url=url_from_header,
+                        url_source="request",
                     )
                 else:
                     error_msg = (

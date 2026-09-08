@@ -10,13 +10,8 @@ from urllib.parse import urlparse
 from requests import PreparedRequest, Response
 from requests.sessions import Session
 from requests.utils import should_bypass_proxies
-from urllib3.poolmanager import PoolManager
 
-from .ssrf_adapter import (
-    SsrfPinningAdapter,
-    _PinnedHTTPConnectionPool,
-    _PinnedHTTPSConnectionPool,
-)
+from .ssrf_adapter import SsrfPinningAdapter
 
 logger = logging.getLogger("mcp-atlassian")
 
@@ -133,23 +128,17 @@ class SSLIgnoreAdapter(NoProxyAdapter):
         context.check_hostname = False
         context.verify_mode = ssl.CERT_NONE
 
-        self.poolmanager = PoolManager(
-            num_pools=connections,
+        super().init_poolmanager(
+            connections=connections,
             maxsize=maxsize,
             block=block,
             ssl_context=context,
             **pool_kwargs,
         )
-        # This adapter mounts at a more specific prefix than the session-wide
-        # SsrfPinningAdapter and would otherwise silently replace it — keep the
-        # DNS-pinning connection classes so disabling SSL verification does not
-        # also disable the SSRF rebinding guard.
-        self.poolmanager.pool_classes_by_scheme = {  # type: ignore[attr-defined]
-            "http": _PinnedHTTPConnectionPool,
-            "https": _PinnedHTTPSConnectionPool,
-        }
 
-    def cert_verify(self, conn: Any, url: str, verify: bool, cert: Any | None) -> None:
+    def cert_verify(
+        self, conn: Any, url: str, verify: bool | str, cert: Any | None
+    ) -> None:
         """Override cert verification to disable SSL verification.
 
         This method is still included for backward compatibility, but the main

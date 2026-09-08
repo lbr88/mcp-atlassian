@@ -8,6 +8,7 @@ from requests.exceptions import ConnectionError, HTTPError
 
 from mcp_atlassian.confluence.pages import PagesMixin
 from mcp_atlassian.confluence.utils import extract_emoji_from_property
+from mcp_atlassian.confluence.v2_adapter import ConfluenceV2Adapter
 from mcp_atlassian.models.confluence import ConfluencePage
 
 
@@ -2913,9 +2914,72 @@ class TestMovePage:
             page_id=page_id,
             position="append",
             target_id=target_parent_id,
+            target_space_key=None,
         )
         pages_mixin.confluence.move_page.assert_not_called()
         assert isinstance(result, ConfluencePage)
+
+    def test_oauth_space_root_move_preserves_page_content(self, pages_mixin):
+        """Resolve the requested space and move beside its root, not beneath it."""
+        base_url = "https://api.atlassian.com/ex/confluence/cloud-1/wiki"
+        session = MagicMock()
+        adapter = ConfluenceV2Adapter(session, base_url)
+        page_state = {
+            "id": "111",
+            "title": "Original title",
+            "content": "<p>Original body</p>",
+            "space": {"key": "OLD"},
+            "version": {"number": 7},
+        }
+        parent_id = "222"
+
+        def get(url, params):
+            response = MagicMock()
+            if url == f"{base_url}/api/v2/spaces" and params == {"keys": "DEST"}:
+                response.json.return_value = {"results": [{"id": "900", "key": "DEST"}]}
+            elif url == f"{base_url}/api/v2/spaces/900/pages" and params == {
+                "depth": "root",
+                "status": "current",
+                "limit": 1,
+            }:
+                response.json.return_value = {
+                    "results": [{"id": "901", "spaceId": "900", "status": "current"}]
+                }
+            else:
+                raise AssertionError(f"Unexpected read: {url}, {params}")
+            return response
+
+        def put(url):
+            nonlocal parent_id
+            # Per the REST contract, after a root page means no parent.
+            assert url == f"{base_url}/rest/api/content/111/move/after/901"
+            parent_id = None
+            page_state["space"] = {"key": "DEST"}
+            return MagicMock()
+
+        session.get.side_effect = get
+        session.put.side_effect = put
+        with (
+            patch.object(
+                type(pages_mixin),
+                "_v2_adapter",
+                PropertyMock(return_value=adapter),
+            ),
+            patch.object(
+                pages_mixin,
+                "get_page_content",
+                side_effect=lambda page_id: ConfluencePage(**page_state),
+            ),
+        ):
+            result = pages_mixin.move_page("111", target_space_key="DEST")
+
+        assert parent_id is None
+        assert result.space.key == "DEST"
+        assert result.id == "111"
+        assert result.title == "Original title"
+        assert result.content == "<p>Original body</p>"
+        assert result.version.number == 7
+        pages_mixin.confluence.move_page.assert_not_called()
 
 
 class TestGetPageVersionDiff:

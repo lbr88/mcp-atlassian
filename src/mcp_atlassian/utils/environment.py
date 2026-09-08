@@ -4,7 +4,7 @@ import logging
 import os
 
 from .env import is_env_truthy
-from .urls import is_atlassian_cloud_url
+from .urls import _get_domain_allowlist, is_atlassian_cloud_url
 
 logger = logging.getLogger("mcp-atlassian.utils.environment")
 
@@ -95,6 +95,10 @@ def get_available_services(
 ) -> dict[str, bool | None]:
     """Determine which services are available based on environment variables and optional headers."""
     headers = headers or {}
+    # Dynamic external-auth routing is explicitly configured by its mandatory
+    # destination allowlist; the auth flag alone must not enable empty services.
+    external_auth = is_env_truthy("ATLASSIAN_EXTERNAL_AUTH_ENABLE")
+    dynamic_external_auth = external_auth and bool(_get_domain_allowlist())
 
     confluence_url = os.getenv("CONFLUENCE_URL")
     confluence_is_setup = False
@@ -128,7 +132,11 @@ def get_available_services(
             "- expecting user-provided tokens via headers"
         )
 
-    if not confluence_is_setup and is_env_truthy("ATLASSIAN_EXTERNAL_AUTH_ENABLE"):
+    if (
+        (confluence_url or dynamic_external_auth)
+        and not confluence_is_setup
+        and external_auth
+    ):
         confluence_is_setup = True
         logger.info(
             "Using Confluence external auth passthrough mode "
@@ -175,7 +183,11 @@ def get_available_services(
             "- expecting user-provided tokens via headers"
         )
 
-    if not jira_is_setup and is_env_truthy("ATLASSIAN_EXTERNAL_AUTH_ENABLE"):
+    if (
+        (jira_url or dynamic_external_auth)
+        and not jira_is_setup
+        and external_auth
+    ):
         jira_is_setup = True
         logger.info(
             "Using Jira external auth passthrough mode "

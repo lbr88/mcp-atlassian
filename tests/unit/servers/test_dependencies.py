@@ -2456,14 +2456,14 @@ class TestSsrfProtection:
 
     def test_redirect_hook_blocks_internal(self) -> None:
         """Redirect to internal IP is blocked by SSRF hook."""
-        from mcp_atlassian.servers.dependencies import _make_ssrf_safe_hook
-        from mcp_atlassian.utils.urls import validate_url_for_ssrf
+        from mcp_atlassian.utils.urls import make_ssrf_redirect_hook
 
-        hook = _make_ssrf_safe_hook(validate_url_for_ssrf)
+        hook = make_ssrf_redirect_hook()
 
         # Create a mock response that simulates a redirect
         mock_response = MagicMock()
         mock_response.is_redirect = True
+        mock_response.url = "https://company.atlassian.net/start"
         mock_response.headers = {"Location": "http://169.254.169.254/latest/meta-data"}
 
         with pytest.raises(ValueError, match="Redirect blocked"):
@@ -2471,13 +2471,13 @@ class TestSsrfProtection:
 
     def test_redirect_hook_allows_safe(self) -> None:
         """Redirect to safe URL passes through."""
-        from mcp_atlassian.servers.dependencies import _make_ssrf_safe_hook
-        from mcp_atlassian.utils.urls import validate_url_for_ssrf
+        from mcp_atlassian.utils.urls import make_ssrf_redirect_hook
 
-        hook = _make_ssrf_safe_hook(validate_url_for_ssrf)
+        hook = make_ssrf_redirect_hook()
 
         mock_response = MagicMock()
         mock_response.is_redirect = True
+        mock_response.url = "https://company.atlassian.net/start"
         mock_response.headers = {
             "Location": "https://company.atlassian.net/rest/api/2/issue"
         }
@@ -2490,10 +2490,9 @@ class TestSsrfProtection:
 
     def test_redirect_hook_ignores_non_redirect(self) -> None:
         """Non-redirect response passes through without checks."""
-        from mcp_atlassian.servers.dependencies import _make_ssrf_safe_hook
-        from mcp_atlassian.utils.urls import validate_url_for_ssrf
+        from mcp_atlassian.utils.urls import make_ssrf_redirect_hook
 
-        hook = _make_ssrf_safe_hook(validate_url_for_ssrf)
+        hook = make_ssrf_redirect_hook()
 
         mock_response = MagicMock()
         mock_response.is_redirect = False
@@ -2503,153 +2502,115 @@ class TestSsrfProtection:
 
 
 class TestSsrfHookCoverageRegression:
-    """Regression (GHSA-6529) — the SSRF redirect hook must cover the basic-auth
-    and OAuth per-user fetcher sessions, not only the header-PAT branch.
-
-    ``_create_and_validate`` used to pass ``attach_ssrf_hook=True`` only on the
-    header-PAT branch; the basic and oauth_pat branches omitted it, so per-user
-    fetchers built from those branches followed HTTP redirects without SSRF
-    validation. These tests assert the secure outcome: a redirect hook is attached
-    to the fetcher's session on every auth branch.
-    """
+    """Exercise real client guards after each dependency configuration path."""
 
     @pytest.mark.security_regression
-    @patch("mcp_atlassian.servers.dependencies.get_http_request")
-    @patch("mcp_atlassian.servers.dependencies.JiraFetcher")
-    async def test_basic_auth_jira_session_has_ssrf_hook(
-        self,
-        mock_jira_fetcher_class,
-        mock_get_http_request,
-        mock_context,
-        mock_request,
-        config_factory,
-    ) -> None:
-        """A basic-auth Jira fetcher must follow redirects through the SSRF hook."""
-        mock_request.state.jira_fetcher = None
-        mock_request.state.confluence_fetcher = None
-        mock_request.state.atlassian_service_headers = {}
-        mock_request.state.user_atlassian_auth_type = "basic"
-        mock_request.state.user_atlassian_email = "user@example.com"
-        mock_request.state.user_atlassian_api_token = "user-api-token"
-        mock_request.state.user_atlassian_token = None
-        mock_request.state.user_atlassian_cloud_id = None
-        mock_get_http_request.return_value = mock_request
+    @pytest.mark.parametrize("service", ["jira", "confluence"])
+    @pytest.mark.parametrize("auth_type", ["basic", "oauth", "header_pat", "external"])
+    async def test_request_fetcher_preserves_url_trust_boundary(
+        self, service, auth_type, monkeypatch, mock_context, config_factory
+    ):
+        import socket
+        from importlib import import_module
 
-        app_context = config_factory.create_app_context()
-        _setup_mock_context(mock_context, app_context)
+        import requests
 
-        mock_fetcher = _create_mock_fetcher(JiraFetcher)
-        mock_jira_fetcher_class.return_value = mock_fetcher
-
-        await get_jira_fetcher(mock_context)
-
-        response_hooks = mock_fetcher.jira._session.hooks["response"]
-        assert len(response_hooks) > 0, (
-            "basic-auth user fetcher session must carry the SSRF redirect hook"
+        for key in ("JIRA_URL", "CONFLUENCE_URL", "MCP_ALLOWED_URL_DOMAINS"):
+            monkeypatch.delenv(key, raising=False)
+        prefix = "Jira" if service == "jira" else "Confluence"
+        config_type = JiraConfig if service == "jira" else ConfluenceConfig
+        fetcher_type = JiraFetcher if service == "jira" else ConfluenceFetcher
+        module = import_module(f"mcp_atlassian.{service}.client")
+        api = MagicMock()
+        api._session = requests.Session()
+        api.default_headers = {}
+        monkeypatch.setattr(module, prefix, lambda **kwargs: api)
+        monkeypatch.setattr(module, "configure_oauth_session", lambda *args: True)
+        validation_method = (
+            "get_current_user_account_id"
+            if service == "jira"
+            else "get_current_user_info"
         )
-
-    @pytest.mark.security_regression
-    @patch("mcp_atlassian.servers.dependencies.get_access_token")
-    @patch("mcp_atlassian.servers.dependencies.get_http_request")
-    @patch("mcp_atlassian.servers.dependencies.JiraFetcher")
-    async def test_oauth_jira_session_has_ssrf_hook(
-        self,
-        mock_jira_fetcher_class,
-        mock_get_http_request,
-        mock_get_access_token,
-        mock_context,
-        mock_request,
-        config_factory,
-        auth_scenarios,
-    ) -> None:
-        """An OAuth Jira fetcher must follow redirects through the SSRF hook."""
-        _setup_mock_request_state(mock_request, auth_scenarios["oauth"])
-        mock_get_http_request.return_value = mock_request
-        mock_get_access_token.side_effect = RuntimeError("no auth context")
-
+        monkeypatch.setattr(fetcher_type, validation_method, lambda self: {})
+        url = "http://dc.example.test:8080"
+        base_config = config_type(
+            url="" if auth_type == "external" else url,
+            auth_type="external" if auth_type == "external" else "oauth",
+            oauth_config=OAuthConfig(
+                client_id="test-client",
+                client_secret="test-secret",
+                redirect_uri="http://localhost/callback",
+                scope="READ",
+                base_url=url,
+            ),
+        )
         app_context = config_factory.create_app_context(
-            jira_config=config_factory.create_jira_config(auth_type="oauth")
+            **{f"{service}_config": base_config}
         )
         _setup_mock_context(mock_context, app_context)
-
-        mock_fetcher = _create_mock_fetcher(JiraFetcher)
-        mock_jira_fetcher_class.return_value = mock_fetcher
-
-        await get_jira_fetcher(mock_context)
-
-        response_hooks = mock_fetcher.jira._session.hooks["response"]
-        assert len(response_hooks) > 0, (
-            "oauth user fetcher session must carry the SSRF redirect hook"
+        state = SimpleNamespace(
+            jira_fetcher=None,
+            confluence_fetcher=None,
+            atlassian_service_headers={},
+            user_atlassian_auth_type=auth_type,
         )
-
-    @pytest.mark.security_regression
-    @patch("mcp_atlassian.servers.dependencies.get_http_request")
-    @patch("mcp_atlassian.servers.dependencies.ConfluenceFetcher")
-    async def test_basic_auth_confluence_session_has_ssrf_hook(
-        self,
-        mock_confluence_fetcher_class,
-        mock_get_http_request,
-        mock_context,
-        mock_request,
-        config_factory,
-    ) -> None:
-        """A basic-auth Confluence fetcher must follow redirects through the hook."""
-        mock_request.state.jira_fetcher = None
-        mock_request.state.confluence_fetcher = None
-        mock_request.state.atlassian_service_headers = {}
-        mock_request.state.user_atlassian_auth_type = "basic"
-        mock_request.state.user_atlassian_email = "user@example.com"
-        mock_request.state.user_atlassian_api_token = "user-api-token"
-        mock_request.state.user_atlassian_token = None
-        mock_request.state.user_atlassian_cloud_id = None
-        mock_get_http_request.return_value = mock_request
-
-        app_context = config_factory.create_app_context()
-        _setup_mock_context(mock_context, app_context)
-
-        mock_fetcher = _create_mock_fetcher(ConfluenceFetcher)
-        mock_confluence_fetcher_class.return_value = mock_fetcher
-
-        await get_confluence_fetcher(mock_context)
-
-        response_hooks = mock_fetcher.confluence._session.hooks["response"]
-        assert len(response_hooks) > 0, (
-            "basic-auth user fetcher session must carry the SSRF redirect hook"
+        if auth_type == "header_pat":
+            state.user_atlassian_auth_type = "pat"
+            state.atlassian_service_headers = {
+                f"X-Atlassian-{prefix}-Url": url,
+                f"X-Atlassian-{prefix}-Personal-Token": "request-pat",
+            }
+        elif auth_type == "external":
+            state.user_atlassian_auth_type = None
+            monkeypatch.setenv("MCP_ALLOWED_URL_DOMAINS", "dc.example.test")
+        else:
+            state.user_atlassian_email = "user@example.test"
+            state.user_atlassian_api_token = "request-api-token"
+            state.user_atlassian_token = "request-oauth-token"
+        request = SimpleNamespace(
+            state=state,
+            url="http://localhost/mcp",
+            headers=Headers({f"X-Atlassian-{prefix}-Url": url}),
         )
-
-    @pytest.mark.security_regression
-    @patch("mcp_atlassian.servers.dependencies.get_access_token")
-    @patch("mcp_atlassian.servers.dependencies.get_http_request")
-    @patch("mcp_atlassian.servers.dependencies.ConfluenceFetcher")
-    async def test_oauth_confluence_session_has_ssrf_hook(
-        self,
-        mock_confluence_fetcher_class,
-        mock_get_http_request,
-        mock_get_access_token,
-        mock_context,
-        mock_request,
-        config_factory,
-        auth_scenarios,
-    ) -> None:
-        """An OAuth Confluence fetcher must follow redirects through the hook."""
-        _setup_mock_request_state(mock_request, auth_scenarios["oauth"])
-        mock_get_http_request.return_value = mock_request
-        mock_get_access_token.side_effect = RuntimeError("no auth context")
-
-        app_context = config_factory.create_app_context(
-            confluence_config=config_factory.create_confluence_config(auth_type="oauth")
-        )
-        _setup_mock_context(mock_context, app_context)
-
-        mock_fetcher = _create_mock_fetcher(ConfluenceFetcher)
-        mock_confluence_fetcher_class.return_value = mock_fetcher
-
-        await get_confluence_fetcher(mock_context)
-
-        response_hooks = mock_fetcher.confluence._session.hooks["response"]
-        assert len(response_hooks) > 0, (
-            "oauth user fetcher session must carry the SSRF redirect hook"
-        )
+        with (
+            patch(
+                "mcp_atlassian.servers.dependencies.get_http_request",
+                return_value=request,
+            ),
+            patch(
+                "mcp_atlassian.servers.dependencies.get_access_token",
+                side_effect=RuntimeError("no auth context"),
+            ),
+        ):
+            fetcher = await (
+                get_jira_fetcher(mock_context)
+                if service == "jira"
+                else get_confluence_fetcher(mock_context)
+            )
+        # External URLs were explicitly allowlisted at the request boundary.
+        # They must not acquire persistent operator trust in their own right.
+        monkeypatch.delenv("MCP_ALLOWED_URL_DOMAINS", raising=False)
+        session = getattr(fetcher, service)._session
+        session.trust_env = False
+        response = requests.Response()
+        response.status_code = 302
+        response.url = url + "/start"
+        response.headers["Location"] = "/next"
+        response._content = b""
+        response._content_consumed = True
+        private_dns = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("10.0.0.5", 8080))]
+        with patch("socket.getaddrinfo", return_value=private_dns):
+            if auth_type in ("header_pat", "external"):
+                with pytest.raises(requests.ConnectionError, match="SSRF blocked"):
+                    session.get(url, timeout=1)
+            else:
+                # Credential-only clones retain the operator's same-origin trust.
+                for hook in session.hooks["response"]:
+                    assert hook(response) is response
+        response.headers["Location"] = "http://169.254.169.254/latest/meta-data"
+        with pytest.raises(ValueError, match="SSRF"):
+            for hook in session.hooks["response"]:
+                hook(response)
 
 
 class TestUnauthenticatedGlobalFallbackRegression:

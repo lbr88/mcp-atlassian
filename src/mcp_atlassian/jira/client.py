@@ -183,15 +183,17 @@ class JiraClient:
             no_proxy=self.config.no_proxy,
         )
 
-        # Validate redirects for SSRF on every outbound call from this session
-        # (covers direct _session.get() paths and global/stdio fetchers, not just
-        # the per-user HTTP path).
-        self.jira._session.hooks["response"].append(make_ssrf_redirect_hook())
-        # Pin DNS resolution against rebinding: resolve+validate once and connect
-        # to that address, closing the validate→reconnect TOCTOU. Preserves TLS SNI.
-        # Config URLs can come from request headers; only the fixed Cloud OAuth
-        # gateway is additionally trusted. Operator URLs are trusted via the env.
-        mount_ssrf_pinning(self.jira._session, "https://api.atlassian.com")
+        # Only operator-selected URLs may reach private DC hosts or use proxies.
+        # Request-derived URLs retain DNS pinning and public-address validation.
+        trusted_urls = (
+            (self.config.url,) if self.config.url_source == "operator" else ()
+        )
+        self.jira._session.hooks["response"].append(
+            make_ssrf_redirect_hook(*trusted_urls)
+        )
+        mount_ssrf_pinning(
+            self.jira._session, "https://api.atlassian.com", *trusted_urls
+        )
 
         # atlassian-python-api's built-in retry_with_header performs an UNBOUNDED,
         # header-driven retry (``time.sleep(int(Retry-After)); retry``). It melts
