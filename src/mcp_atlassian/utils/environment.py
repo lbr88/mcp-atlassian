@@ -183,11 +183,7 @@ def get_available_services(
             "- expecting user-provided tokens via headers"
         )
 
-    if (
-        (jira_url or dynamic_external_auth)
-        and not jira_is_setup
-        and external_auth
-    ):
+    if (jira_url or dynamic_external_auth) and not jira_is_setup and external_auth:
         jira_is_setup = True
         logger.info(
             "Using Jira external auth passthrough mode "
