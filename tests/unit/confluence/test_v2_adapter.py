@@ -55,7 +55,7 @@ class TestConfluenceV2Adapter:
 
     @pytest.mark.parametrize("status_code", [401, 403])
     @pytest.mark.parametrize("failure_stage", ["space", "root"])
-    def test_move_to_root_preserves_auth_failure(
+    def test_root_move_auth_error(
         self, v2_adapter, mock_session, status_code, failure_stage
     ):
         failed_response = Mock(status_code=status_code)

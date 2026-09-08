@@ -268,7 +268,7 @@ class TestConfluenceClientExternalAuth:
 
 
 class TestGetAvailableServicesExternalAuth:
-    def test_services_unavailable_with_only_flag(self):
+    def test_flag_requires_url(self):
         """External auth still requires each service's configured URL."""
         with patch.dict(
             os.environ,
