@@ -295,7 +295,7 @@ def private_dc_server():
     from urllib.parse import urlsplit
 
     class Handler(BaseHTTPRequestHandler):
-        def do_GET(self):
+        def do_GET(self) -> None:  # noqa: N802
             if urlsplit(self.path).path == "/start":
                 self.send_response(302)
                 self.send_header("Location", "/ok")
